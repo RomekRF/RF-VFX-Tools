@@ -42,3 +42,15 @@ out_gltf/
 # --- generated outputs / local scratch ---
 _archive/
 *.roundtrip.vfx
+
+# Dev backup files
+*.bak
+*.bak-*
+*.bak_*
+_bak_*/
+*.spec
+
+# Error reports
+error reports/
+exception.txt
+minidump.dmp
