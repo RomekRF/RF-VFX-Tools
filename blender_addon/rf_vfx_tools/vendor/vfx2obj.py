@@ -80,28 +80,30 @@ class Bin:
         return s
 
 # ----------------------------
-# RF ↔ Blender coordinate conversion
-# Blender: X=right, Y=forward, Z=up (Z-up right-handed)
-# RF:      X=side,  Y=up,      Z=forward (Y-up)
+# RF ↔ glTF Y-up RH conversion (Redux convention)
+# RF: X=side, Y=up, Z=forward (left-handed Y-up)
+# glTF: X=right, Y=up, Z=forward (right-handed Y-up — same axes, opposite handedness)
+# Conversion is just "negate X" (Redux's RfToRh).
 #
-# blender_to_rf(bx,by,bz) = (-by, bz, -bx)
-# rf_to_blender(rx,ry,rz) = (-rz, -rx, ry)
-# det = +1 (proper rotation, no winding flip)
+# Blender's glTF importer then applies Y-up→Z-up automatically. The combined
+# effect places mesh data in the V3M-tool-aligned Blender Z-up frame.
+#
+# Note: these functions are still named *_blender for compatibility with
+# call sites that predate this design. They produce glTF-space data that
+# Blender's importer will then rotate.
+# det(M) = -1 → triangle winding flips on round-trip (handled separately).
 # ----------------------------
 
 def rf_to_blender(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """RF Y-up → Blender Z-up. Inverse of blender_to_rf."""
+    """RF (left-handed Y-up) → glTF (right-handed Y-up). Just negate X."""
     sx, sy, sz = v
-    return (-sz, -sx, sy)
+    return (-sx, sy, sz)
 
 
 def blender_to_rf(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """Blender Z-up → RF Y-up. (-by, bz, -bx). det=+1."""
+    """glTF (right-handed Y-up) → RF (left-handed Y-up). Self-inverse."""
     bx, by, bz = v
-    sx = -by
-    sy = bz
-    sz = -bx
-    return (sx, sy, sz)
+    return (-bx, by, bz)
 
 # --- glTF vertex-space <-> RF conversions ---
 # Blender's glTF exporter keeps vertex/node data in Blender Z-up space.
@@ -170,12 +172,21 @@ def read_quat_raw(b: Bin) -> Tuple[float, float, float, float]:
 # ----------------------------
 
 # M maps Blender vectors to RF vectors: v_rf = M * v_bl
-# (-by, bz, -bx). det=+1 (proper rotation, no winding fix needed).
-# M = [[0,-1,0],[0,0,1],[-1,0,0]]
+# Convention: RF ↔ glTF Y-up RH conversion is just "negate X" (Redux's RfToRh).
+# Blender's glTF importer applies its own Y-up→Z-up rotation on top, which
+# combined with our negate-X gives the V3M-tool-aligned final orientation in
+# Blender. We rely on Blender's importer for the up-axis swap rather than
+# baking it into our data — older code tried to bake it in via _M and use
+# `import_yup=False`, but that flag doesn't exist in Blender 4.x's glTF
+# importer (Blender always applies Y-up→Z-up), which produced the
+# "model lying flat" symptom.
+# det(M) = -1 (reflection — triangle winding flips on round-trip;
+# _flip_gltf_winding_in_place compensates).
+# M = diag(-1, 1, 1)
 _M = (
-    ( 0.0,-1.0, 0.0),
-    ( 0.0, 0.0, 1.0),
     (-1.0, 0.0, 0.0),
+    ( 0.0, 1.0, 0.0),
+    ( 0.0, 0.0, 1.0),
 )
 
 def mat3_mul(a, b):
@@ -253,17 +264,18 @@ def quat_norm(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,floa
     return (x*inv,y*inv,z*inv,w*inv)
 
 def quat_rf_to_blender(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    R = quat_to_mat3(q)
-    Rt = mat3_mul(mat3_mul(_M, R), mat3_T(_M))
-    return mat3_to_quat(Rt)
+    # RF ↔ glTF Y-up RH quaternion conversion: just negate X (Redux's RfToRh).
+    # Self-inverse, like the position conversion. Blender's glTF importer
+    # then rotates the entire scene Y-up→Z-up, which carries the quaternion
+    # along correctly without any further work needed here.
+    qx, qy, qz, qw = q
+    return (-qx, qy, qz, qw)
 
 
 def quat_blender_to_rf(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    # Inverse of quat_rf_to_blender.
-    # If qb = M * qrf * M^T (as rotation matrices), then qrf = M^T * qb * M.
-    Rb = quat_to_mat3(q)
-    Rt = mat3_mul(mat3_mul(mat3_T(_M), Rb), _M)
-    return mat3_to_quat(Rt)
+    # Self-inverse: same operation as quat_rf_to_blender.
+    qx, qy, qz, qw = q
+    return (-qx, qy, qz, qw)
 
 def quat_dot(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -> float:
     return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]

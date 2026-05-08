@@ -1,10 +1,10 @@
 bl_info = {
     "name": "RF VFX Tools",
     "author": "RomekRF",
-    "version": (0, 7, 1),
+    "version": (0, 7, 8),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > RF VFX",
-    "description": "Standalone RF1 VFX (.vfx) <-> glTF workflow. Keeps morph targets + extras compatible with Blender glTF importer/exporter.",
+    "description": "Create and edit Red Faction 1 .vfx files in Blender. Aligned with RF Static Mesh Tools / RF Character Tools coordinate convention. Import RFG/WRL map geometry, morph animation, particles, dummies — no 3ds Max required.",
     "category": "Import-Export",
 }
 
@@ -35,14 +35,21 @@ def _gltf_export(filepath: str, use_selection: bool, export_apply: bool, frame_s
         "filepath": filepath,
         "export_format": "GLTF_SEPARATE",
         "use_selection": bool(use_selection),
-        "export_apply": bool(export_apply),
     }
-    # CRITICAL: export_yup=False keeps ALL data in Blender Z-up space.
-    # Our blender_to_rf handles the single Z-up → RF Y-up conversion.
-    # Without this, the exporter converts to Y-up and then blender_to_rf
-    # converts AGAIN, causing a 90° rotation.
+    # export_apply was renamed to use_mesh_modifiers in Blender 4.x.
+    # Try the old name first, fall back to the new name so transforms
+    # are actually applied on all supported Blender versions.
+    if _op_has_prop(op, "export_apply"):
+        kwargs["export_apply"] = bool(export_apply)
+    elif _op_has_prop(op, "use_mesh_modifiers"):
+        kwargs["use_mesh_modifiers"] = bool(export_apply)
+    # Explicitly set export_yup=True even though it's the documented default.
+    # Blender's operator system uses last-used UI values as runtime defaults,
+    # so if the user ever unchecked "+Y Up" in an export dialog this session,
+    # subsequent script exports inherit that. Setting it explicitly removes
+    # the dependency on UI state.
     if _op_has_prop(op, "export_yup"):
-        kwargs["export_yup"] = False
+        kwargs["export_yup"] = True
 
     if full_mode:
         # Enable normals, UVs, materials for true export
@@ -111,10 +118,13 @@ def _gltf_import(filepath: str):
     # Preserve extras into Blender custom properties (so they can be exported back out).
     if _op_has_prop(op, "import_extras"):
         kwargs["import_extras"] = True
-    # CRITICAL: import_yup=False prevents Blender from applying Y-up→Z-up conversion.
-    # Our rf_to_blender already outputs Z-up data.
-    if _op_has_prop(op, "import_yup"):
-        kwargs["import_yup"] = False
+    # NOTE: We deliberately do NOT pass import_yup=False here. vfx2obj writes
+    # glTF data in standard Y-up RH form (Redux convention: RF→glTF is just
+    # negate-X). Blender's importer rotates Y-up→Z-up automatically, which
+    # combined with the negate-X gives the V3M-tool-aligned final orientation.
+    # Older builds tried import_yup=False — that flag doesn't exist in
+    # Blender 4.x's glTF importer (the rotation always happens), which made
+    # imported meshes lie flat on their backs.
     return op(**kwargs)
 
 
@@ -419,23 +429,13 @@ class RFVFX_Settings(bpy.types.PropertyGroup):
     vfx_name: StringProperty(name="VFX Name", default="",
         description="Name for the exported VFX file. Leave blank to auto-name from template or .blend file")
 
-    alpine_faction: BoolProperty(name="Alpine Faction", default=True,
-        description="(internal) Alpine Faction mode - always on")
 
     import_vfx: StringProperty(name="VFX File", subtype="FILE_PATH", default="")
-    import_scale: FloatProperty(name="Scale", default=1.0, min=0.0001, max=100000.0)
-    import_anchor: StringProperty(name="Anchor (optional)", default="")
-    import_debug: BoolProperty(name="Debug", default=False)
 
     export_vfx_out: StringProperty(name="Output VFX", subtype="FILE_PATH", default="")
     export_template_vfx: StringProperty(name="Template VFX", subtype="FILE_PATH", default="")
     use_last_import_as_template: BoolProperty(name="Use last imported VFX as Template", default=False)
 
-    export_gltf_scale: FloatProperty(name="Export Scale", default=1.0, min=0.0001, max=100000.0)
-    export_anchor: StringProperty(name="Anchor (optional)", default="")
-    fix_winding: BoolProperty(name="Flip Faces", default=False,
-        description="Reverses the winding order of all faces on export. Use if your mesh renders inside-out in-game.")    # IMPORTANT: default OFF. When ON, Blender bakes object transforms into vertices,
-    # which will shift RF assets and can wipe out the template-authored TRS.
     export_apply_transforms: BoolProperty(name="Apply Transforms", default=True,
         description="Bake object Location/Rotation/Scale into mesh data before export. Recommended ON to ensure correct orientation")
 
@@ -491,8 +491,17 @@ class RFVFX_Settings(bpy.types.PropertyGroup):
     show_import_advanced: BoolProperty(name="Advanced", default=False)
     show_export_advanced: BoolProperty(name="Advanced", default=False)
     show_prep_tools: BoolProperty(name="Prepare", default=False)
-    show_authoring_tips: BoolProperty(name="Tips", default=True)
     keep_temp: BoolProperty(name="Keep Temp Files", default=False)
+
+    export_anchor: StringProperty(
+        name="Export Anchor",
+        description=(
+            "Object whose world position becomes (0,0,0) in the exported VFX. "
+            "Only affects root-level objects. Leave blank to skip recentering. "
+            "Default 'RFVFX_ROOT' matches the convention used by imports"
+        ),
+        default="RFVFX_ROOT",
+    )
 
 class RFVFX_OT_ImportVFX(bpy.types.Operator):
     bl_idname = "rfvfx.import_vfx"
@@ -541,9 +550,7 @@ class RFVFX_OT_ImportVFX(bpy.types.Operator):
             ver2, kept, skipped, start = _normalize_pad_header_keep_version(vfx, norm_vfx)
             header += f"Normalize: start_off={start} kept={kept} skipped={skipped} ver_preserved=0x{ver2:08X}\n\n"
 
-            args = ["--gltf", "--scale", str(s.import_scale)]
-            if s.import_debug: args.append("--debug-frames")
-            if s.import_anchor.strip(): args += ["--anchor", s.import_anchor.strip()]
+            args = ["--gltf"]
             args.append(norm_vfx)
 
             header += "Run:\n  vfx2obj.py " + " ".join(args) + "\n"
@@ -563,12 +570,16 @@ class RFVFX_OT_ImportVFX(bpy.types.Operator):
                     shutil.rmtree(tmpdir, ignore_errors=True)
                 return {"CANCELLED"}
 
-            # ✅ fix inside-out (winding) before Blender imports it
-            flip_msg = ""
-            if False and s.fix_winding:  # det=+1, no flip needed
-                flip_msg = _flip_gltf_winding_in_place(gltf)
+            # The new RF↔Blender conversion has det=-1 (reflection), so the
+            # glTF written by vfx2obj has inverted triangle winding for Blender.
+            # Flip it back so faces show correct normals/visibility in Blender.
+            try:
+                wfix = _flip_gltf_winding_in_place(gltf)
+                header += wfix + "\n"
+            except Exception as e:
+                header += f"flip_winding (import) failed: {e}\n"
 
-            _write_log(header, out + ("\n\n" + flip_msg if flip_msg else ""))
+            _write_log(header, out)
 
             _gltf_import(filepath=gltf)
 
@@ -694,7 +705,6 @@ class RFVFX_OT_ExportVFX(bpy.types.Operator):
         header += f"Template v4.6 TRS patch enabled: {tmpl_ok}\n"
         if tmpl_end is not None and tmpl_end > 0 and bool(s.export_use_template_frame_range):
             header += f"Template end_frame: {tmpl_end} (will match export range)\n"
-        header += f"Winding fix enabled: {bool(s.fix_winding)}\n"
         header += f"Morph FPS: {s.morph_fps}\n"
         header += f"Temp: {tmpdir}\n\n"
 
@@ -713,6 +723,9 @@ class RFVFX_OT_ExportVFX(bpy.types.Operator):
             try:
                 # Sync PropertyGroup values → custom properties for glTF export
                 _scene_double_sided = bool(s.double_sided)
+                # Declared here so the finally block can safely iterate even if
+                # we bail out before the rename loop runs.
+                _mat_renames = {}
                 for _sobj in _export_objs(context.scene):
                     try:
                         if hasattr(_sobj, "rfvfx_props"):
@@ -736,7 +749,6 @@ class RFVFX_OT_ExportVFX(bpy.types.Operator):
                 # vfx2obj reads the glTF material name as a reliable fallback for
                 # tex0 resolution — more reliable than custom property export which
                 # varies by Blender version. Restored in the finally block.
-                _mat_renames = {}
                 for _sobj in _export_objs(context.scene):
                     if _sobj.type != "MESH":
                         continue
@@ -838,10 +850,14 @@ class RFVFX_OT_ExportVFX(bpy.types.Operator):
             except Exception as e:
                 header += f"Baked sidecar write failed: {e}\n"
 
-            flip_msg = ""
-            # det(M)=+1, no winding fix needed on export.
-            if False and s.fix_winding:  # det=+1, no flip needed
-                flip_msg = _flip_gltf_winding_in_place(gltf_path)
+            # The new RF↔Blender conversion has det=-1, so before handing the
+            # glTF to vfx2obj for RF export we need to flip winding so the RF
+            # output has the correct face orientation in-game.
+            try:
+                wfix = _flip_gltf_winding_in_place(gltf_path)
+                header += wfix + "\n"
+            except Exception as e:
+                header += f"flip_winding (export) failed: {e}\n"
 
             has_rf_meta = _gltf_has_rf_keyframed_meta(gltf_path)
             header += f"glTF has rf_vfx keyframed meta: {bool(has_rf_meta)}\n"
@@ -881,7 +897,7 @@ class RFVFX_OT_ExportVFX(bpy.types.Operator):
                 rc1, out1 = _run_vendor("vfx2obj.py", args, cwd=_vendor_dir())
 
             if rc1 != 0:
-                _write_log(header, out1 + ("\n\n" + flip_msg if flip_msg else ""))
+                _write_log(header, out1)
                 _popup("Export failed. Open Text Editor → RFVFX_Log.", title="RF VFX: Export")
                 if not s.keep_temp:
                     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -897,7 +913,7 @@ class RFVFX_OT_ExportVFX(bpy.types.Operator):
                     header += "\nRun template TRS patch:\n  pivot_patch_xkey0.py " + " ".join(args2) + "\n"
                     rc2, out2 = _run_vendor("pivot_patch_xkey0.py", args2, cwd=_vendor_dir())
                     if rc2 != 0:
-                        _write_log(header, out1 + "\n\n" + out2 + ("\n\n" + flip_msg if flip_msg else ""))
+                        _write_log(header, out1 + "\n\n" + out2)
                         _popup("Pivot fix failed. Open Text Editor → RFVFX_Log.", title="RF VFX: Export")
                         if not s.keep_temp:
                             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -905,7 +921,7 @@ class RFVFX_OT_ExportVFX(bpy.types.Operator):
                 else:
                     shutil.copyfile(tmp_vfx, out_vfx)
 
-            _write_log(header, out1 + ("\n\n" + out2 if out2 else "") + ("\n\n" + flip_msg if flip_msg else ""))
+            _write_log(header, out1 + ("\n\n" + out2 if out2 else ""))
 
             if not s.keep_temp:
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1009,7 +1025,7 @@ class RFVFX_OT_ValidateFolder(bpy.types.Operator):
         vfx_files.sort()
 
         report = {
-            "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             "input_dir": in_dir,
             "out_dir": out_dir,
             "file_count": len(vfx_files),
@@ -1189,21 +1205,6 @@ _classes = (
     RFVFX_OT_ValidateFolder,
     RFVFX_PT_Panel,
 )
-
-
-
-def register():
-    for c in _classes:
-        bpy.utils.register_class(c)
-    bpy.types.Scene.rfvfx = PointerProperty(type=RFVFX_Settings)
-
-def unregister():
-    try:
-        del bpy.types.Scene.rfvfx
-    except Exception:
-        pass
-    for c in reversed(_classes):
-        bpy.utils.unregister_class(c)
 
 
 # === RFVFX_AUTHORING_WIZARD_V053 ===
@@ -1404,12 +1405,17 @@ class RFVFX_OT_CreateParticleEmitter(bpy.types.Operator):
             coll = context.collection
         coll.objects.link(empty)
 
+        # Place at 3D cursor so the emitter appears where the user is working
+        # rather than at world origin. Matches the behaviour of _make_dummy().
+        empty.location = context.scene.cursor.location.copy()
+
         # Set particle properties
         pp = empty.rfvfx_particle
         pp.is_emitter = True
 
         # Select and make active
-        bpy.ops.object.select_all(action="DESELECT")
+        if context.mode == "OBJECT":
+            bpy.ops.object.select_all(action="DESELECT")
         empty.select_set(True)
         context.view_layer.objects.active = empty
 
@@ -1915,7 +1921,7 @@ class RFVFX_OT_Dummy_Interface(bpy.types.Operator):
 class RFVFX_OT_AddSelectedToRF(bpy.types.Operator):
     bl_idname = "rfvfx.add_selected_to_rf"
     bl_label = "Add Selected To RF_VFX"
-    bl_description = "Moves the selected objects into the RF_VFX collection so they are included in the export. Run 'New RF VFX Scene' first."
+    bl_description = "Moves selected objects (and their children/parents) into the RF_VFX collection. Cleans up empty collections afterwards."
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1930,27 +1936,78 @@ class RFVFX_OT_AddSelectedToRF(bpy.types.Operator):
             self.report({"ERROR"}, "No objects selected.")
             return {"CANCELLED"}
 
+        # Collect full set: selected + all their children recursively
+        # + armature parents of any selected mesh (Mixamo imports etc.)
+        def collect_with_children(obj, seen):
+            if obj in seen:
+                return
+            seen.add(obj)
+            for child in obj.children:
+                collect_with_children(child, seen)
+
+        to_move = set()
         for obj in sel:
-            # link to RF collection
+            collect_with_children(obj, to_move)
+            # If mesh has an armature parent not already selected, include it
+            if obj.type == "MESH" and obj.parent and obj.parent.type == "ARMATURE":
+                collect_with_children(obj.parent, to_move)
+            # If armature, include mesh children
+            if obj.type == "ARMATURE":
+                for child in obj.children:
+                    collect_with_children(child, to_move)
+
+        moved = 0
+        for obj in to_move:
+            # Link into RF_VFX if not already there
             if obj.name not in col.objects:
                 col.objects.link(obj)
 
-            # mark export on + init props
+            # Mark for export
             try:
-                if not hasattr(obj, "rfvfx_props") or obj.rfvfx_props is None:
-                    pass
-                else:
+                if hasattr(obj, "rfvfx_props") and obj.rfvfx_props is not None:
                     obj.rfvfx_props.export = True
                     _sync_obj_to_idprops(obj)
             except Exception:
                 pass
-
             try:
                 obj["rfvfx_export"] = 1
             except Exception:
                 pass
+            moved += 1
 
-        self.report({"INFO"}, f"Added {len(sel)} object(s) to '{col.name}'.")
+        # Remove objects from all other collections they were in
+        # (except the master scene collection and RF_VFX itself)
+        for obj in to_move:
+            for other_col in list(obj.users_collection):
+                if other_col == col:
+                    continue
+                if other_col == scene.collection:
+                    continue
+                try:
+                    other_col.objects.unlink(obj)
+                except Exception:
+                    pass
+
+        # Clean up collections that are now empty (except RF_VFX and master)
+        cleaned = []
+        for other_col in list(bpy.data.collections):
+            if other_col == col:
+                continue
+            if other_col.name == "RF_VFX":
+                continue
+            # Only remove if it has no objects and no children
+            if len(other_col.objects) == 0 and len(other_col.children) == 0:
+                # Unlink from scene if linked
+                try:
+                    scene.collection.children.unlink(other_col)
+                    cleaned.append(other_col.name)
+                except Exception:
+                    pass
+
+        msg = f"Moved {moved} object(s) to '{col.name}'."
+        if cleaned:
+            msg += f" Removed empty collection(s): {', '.join(cleaned)}."
+        self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 class RFVFX_OT_ArrangeScene(bpy.types.Operator):
@@ -2105,6 +2162,7 @@ class RFVFX_OT_ExportAuthoringGLTF(bpy.types.Operator):
             "export_format": "GLTF_SEPARATE",
             "use_selection": False,
             "export_apply": True,
+            "use_mesh_modifiers": True,
             "export_extras": True,
             "export_custom_properties": True,
             "export_normals": True,
@@ -2112,7 +2170,7 @@ class RFVFX_OT_ExportAuthoringGLTF(bpy.types.Operator):
             "export_animations": True,
             "export_morph": True,
             "export_shape_keys": True,
-            "export_yup": False,
+            "export_yup": True,  # explicit: don't inherit from UI state
         }
         # Filter to only props supported by this Blender version
         call = {k: v for k, v in kwargs.items() if k in props}
@@ -2143,7 +2201,7 @@ class RFVFX_OT_BakeAnimToShapeKeys(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     frame_start: IntProperty(name="Start Frame", default=1, min=0, max=10000)
-    frame_end: IntProperty(name="End Frame", default=20, min=1, max=10000)
+    frame_end: IntProperty(name="End Frame", default=20, min=1, max=20000)
     step: IntProperty(
         name="Speed Step",
         default=1, min=1, max=20,
@@ -2296,8 +2354,8 @@ class RFVFX_OT_BakeAnimToShapeKeys(bpy.types.Operator):
             return {"CANCELLED"}
 
         num_keys = len(range(frame_start, frame_end + 1, step))
-        if num_keys > 500:
-            self.report({"ERROR"}, f"Too many shape keys ({num_keys}). Reduce range or increase Step. Max 500.")
+        if num_keys > 2000:
+            self.report({"ERROR"}, f"Too many shape keys ({num_keys}). Reduce range or increase Step. Max 2000.")
             return {"CANCELLED"}
 
         me = obj.data
@@ -2501,7 +2559,19 @@ class RFVFX_OT_ArmatureToShapeKeys(bpy.types.Operator):
             sources.append(mesh_obj.animation_data.action)
 
         for act in sources:
-            # Legacy fcurves (Blender < 5.0)
+            # Use action.frame_range first — Blender sets this automatically
+            # and it's the most reliable way to get the actual animation extent.
+            try:
+                fr = act.frame_range
+                f_start = int(fr[0])
+                f_end   = int(fr[1])
+                if f_end > f_start:
+                    first_kf = f_start if first_kf is None else min(first_kf, f_start)
+                    last_kf  = f_end   if last_kf  is None else max(last_kf,  f_end)
+                    continue
+            except Exception:
+                pass
+            # Legacy fcurves fallback (Blender < 5.0)
             try:
                 for fc in getattr(act, "fcurves", []):
                     for kp in fc.keyframe_points:
@@ -2543,14 +2613,26 @@ class RFVFX_OT_ArmatureToShapeKeys(bpy.types.Operator):
             self.report({"ERROR"}, f"Animation range too short ({frame_start}–{frame_end}). Check armature action has keyframes.")
             return {"CANCELLED"}
 
-        if num_frames > 500:
-            self.report({"ERROR"}, f"Too many frames ({num_frames}). Reduce the action length or trim start/end. Max 500.")
+        if num_frames > 2000:
+            self.report({"ERROR"}, f"Too many frames ({num_frames}). Reduce the action length or trim start/end. Max 2000.")
             return {"CANCELLED"}
 
         # --- Make mesh_obj the active selection ---
         bpy.ops.object.select_all(action="DESELECT")
         mesh_obj.select_set(True)
         context.view_layer.objects.active = mesh_obj
+
+        # --- Apply rotation and scale before baking ---
+        # Mixamo FBX imports typically arrive with unapplied rotation (-90° X)
+        # and scale (100x) on the object. Shape key coords are stored in local
+        # mesh space, so if these transforms aren't applied first, the baked
+        # shape keys will have wrong orientation and scale.
+        # We apply rotation+scale (not location) so the mesh data is correct
+        # while preserving the object's world position.
+        try:
+            bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+        except Exception as e:
+            self.report({"WARNING"}, f"Could not apply transforms: {e}. Results may have wrong scale/orientation.")
 
         me = mesh_obj.data
         num_verts = len(me.vertices)
@@ -2710,8 +2792,8 @@ class RFVFX_OT_KeyedShapesToRFTiming(bpy.types.Operator):
         anim_keys = list(sk.key_blocks[1:])
         num_keys = len(anim_keys)
 
-        if num_keys > 500:
-            self.report({"ERROR"}, f"Too many shape keys ({num_keys}). Max 500 for RF. Reduce key count.")
+        if num_keys > 2000:
+            self.report({"ERROR"}, f"Too many shape keys ({num_keys}). Max 2000 for RF. Reduce key count.")
             return {"CANCELLED"}
 
         frame_start = scene.frame_start
@@ -2768,6 +2850,376 @@ class RFVFX_OT_KeyedShapesToRFTiming(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _quake_mdl_to_rf_cos(verts_raw, scale, scale_origin):
+    """Convert Quake MDL compressed vertex bytes to RF-ready Blender coords.
+    MDL stores verts as 3 unsigned bytes scaled by per-file scale + origin.
+    Quake axes: X=forward, Y=left, Z=up.
+    RF/Blender pipeline expects Blender axes with RF unit scale.
+    RF uses feet; Quake uses inches. 1 inch = 1/12 foot.
+    Scale factor 0.08333 (1/12) converts Quake inches to RF feet (Blender units).
+    Axis mapping: Quake X->Bl -Y, Quake Y->Bl -X, Quake Z->Bl Z
+    then blender_to_rf inverse applies on export.
+    """
+    INCH_TO_RF = 1.0 / 12.0  # 1 Quake inch = 1/12 RF foot
+    sx, sy, sz = scale
+    ox, oy, oz = scale_origin
+    out = []
+    for (bx, by, bz) in verts_raw:
+        qx = bx * sx + ox
+        qy = by * sy + oy
+        qz = bz * sz + oz
+        blx = -qy * INCH_TO_RF
+        bly = -qx * INCH_TO_RF
+        blz =  qz * INCH_TO_RF
+        out.extend([blx, bly, blz])
+    return out
+
+
+def _quake_md2_frame_cos(verts_raw, scale, translate):
+    """Convert MD2 compressed vertex bytes to RF-ready Blender coords.
+    MD2 per-frame scale/translate unpacks 0-255 bytes to world coords.
+    Same axis mapping and scale as MDL. 1 Quake inch = 1/12 RF foot.
+    """
+    INCH_TO_RF = 1.0 / 12.0
+    sx, sy, sz = scale
+    tx, ty, tz = translate
+    out = []
+    for v in verts_raw:
+        bx_raw, by_raw, bz_raw = v[0], v[1], v[2]
+        qx = bx_raw * sx + tx
+        qy = by_raw * sy + ty
+        qz = bz_raw * sz + tz
+        blx = -qy * INCH_TO_RF
+        bly = -qx * INCH_TO_RF
+        blz =  qz * INCH_TO_RF
+        out.extend([blx, bly, blz])
+    return out
+
+
+def _read_mdl(filepath):
+    """Parse a Quake 1 .mdl file. Returns dict with mesh and frame data."""
+    import struct as _st
+    with open(filepath, "rb") as f:
+        raw = f.read()
+    pos = 0
+    def ru(fmt):
+        nonlocal pos
+        size = _st.calcsize(fmt)
+        val = _st.unpack_from(fmt, raw, pos)
+        pos += size
+        return val
+
+    ident = raw[0:4]
+    pos = 4
+    (version,) = ru("<i")
+    if ident not in (b"IDPO", b"MD16") or version not in (3, 6):
+        raise ValueError(f"Not a valid Quake MDL file (ident={ident} version={version})")
+
+    scale        = ru("<3f")
+    scale_origin = ru("<3f")
+    pos += 4  # bounding radius
+    pos += 12 # eye position
+    (num_skins,)   = ru("<i")
+    skinw, skinh   = ru("<2i")
+    numverts, numtris, numframes = ru("<3i")
+    pos += 4  # synctype
+    if version == 6:
+        pos += 8  # flags + size
+
+    # Skip skin data
+    for _ in range(num_skins):
+        (skin_type,) = ru("<i")
+        if skin_type:
+            (n,) = ru("<i")
+            pos += n * 4          # times
+            pos += n * skinw * skinh
+        else:
+            pos += skinw * skinh
+
+    # Skip ST verts
+    pos += numverts * 12
+
+    # Read tris (facesfront + 3 vert indices)
+    tris = []
+    for _ in range(numtris):
+        ff, v0, v1, v2 = ru("<4i")
+        tris.append((v2, v1, v0))  # reverse winding for Blender
+
+    # Read frames
+    frames = []
+    frame_names = []
+    for fi in range(numframes):
+        (ftype,) = ru("<i")
+        if ftype:
+            # frame group
+            (nsubframes,) = ru("<i")
+            pos += 8   # mins/maxs bounds
+            pos += nsubframes * 4  # times
+            for sfi in range(nsubframes):
+                pos += 8  # sub mins/maxs
+                name_bytes = raw[pos:pos+16]; pos += 16
+                name = name_bytes.split(b"\x00")[0].decode("latin1", errors="replace")
+                verts_raw = []
+                for _ in range(numverts):
+                    bx, by, bz, ni = ru("<4B")
+                    verts_raw.append((bx, by, bz))
+                frames.append(verts_raw)
+                frame_names.append(name)
+        else:
+            pos += 8  # mins/maxs
+            name_bytes = raw[pos:pos+16]; pos += 16
+            name = name_bytes.split(b"\x00")[0].decode("latin1", errors="replace")
+            verts_raw = []
+            for _ in range(numverts):
+                bx, by, bz, ni = ru("<4B")
+                verts_raw.append((bx, by, bz))
+            frames.append(verts_raw)
+            frame_names.append(name)
+
+    return {
+        "scale": scale, "scale_origin": scale_origin,
+        "numverts": numverts, "tris": tris,
+        "frames": frames, "frame_names": frame_names,
+        "num_skins": num_skins, "skinwidth": skinw, "skinheight": skinh,
+    }
+
+
+def _read_md2(filepath):
+    """Parse a Quake 2 .md2 file. Returns dict with mesh and frame data."""
+    import struct as _st
+    with open(filepath, "rb") as f:
+        raw = f.read()
+
+    (ident, version, skinw, skinh, framesize,
+     num_skins, num_xyz, num_st, num_tris, num_glcmds, num_frames,
+     ofs_skins, ofs_st, ofs_tris, ofs_frames, ofs_glcmds, ofs_end
+    ) = _st.unpack_from("<17i", raw, 0)
+
+    if ident != 0x32504449:  # 'IDP2'
+        raise ValueError("Not a valid Quake 2 MD2 file")
+
+    # Read tris
+    tris = []
+    for i in range(num_tris):
+        off = ofs_tris + i * 12
+        v0, v1, v2 = _st.unpack_from("<3H", raw, off)
+        tris.append((v2, v1, v0))  # reverse winding
+
+    # Read frames
+    frames = []
+    frame_names = []
+    frame_size = 40 + num_xyz * 4
+    for fi in range(num_frames):
+        off = ofs_frames + fi * frame_size
+        sx, sy, sz = _st.unpack_from("<3f", raw, off)
+        tx, ty, tz = _st.unpack_from("<3f", raw, off + 12)
+        name = raw[off+24:off+40].split(b"\x00")[0].decode("latin1", errors="replace")
+        verts = []
+        for vi in range(num_xyz):
+            voff = off + 40 + vi * 4
+            bx, by, bz, ni = _st.unpack_from("<4B", raw, voff)
+            verts.append((bx, by, bz))
+        frames.append({"scale": (sx,sy,sz), "translate": (tx,ty,tz), "verts": verts})
+        frame_names.append(name)
+
+    return {
+        "numverts": num_xyz, "tris": tris,
+        "frames": frames, "frame_names": frame_names,
+        "skinwidth": skinw, "skinheight": skinh,
+    }
+
+
+class RFVFX_OT_ImportQuakeModel(bpy.types.Operator):
+    """Import a Quake MDL or MD2 file directly into RF_VFX as shape key
+    morph animation. Handles axis conversion (Quake->RF) and scale (inches->m)
+    automatically. For large MD2 files, use Start/End Frame to import a subset."""
+    bl_idname = "rfvfx.import_quake_model"
+    bl_label = "Import Quake Model (MDL/MD2)..."
+    bl_description = (
+        "Import a Quake 1 .mdl or Quake 2 .md2 file as RF morph animation. "
+        "Handles coordinate conversion and scale automatically. "
+        "Large MD2 files: use Start/End Frame to import a frame range."
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.mdl;*.md2", options={"HIDDEN"})
+
+    frame_start: bpy.props.IntProperty(
+        name="Start Frame", default=0, min=0,
+        description="First animation frame to import (0 = beginning)"
+    )
+    frame_end: bpy.props.IntProperty(
+        name="End Frame", default=0, min=0,
+        description="Last animation frame to import (0 = all frames)"
+    )
+    step: bpy.props.IntProperty(
+        name="Step", default=1, min=1, max=10,
+        description="Import every Nth frame. Step=2 halves frame count and file size."
+    )
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.label(text="Frame Range (0 = auto):")
+        layout.prop(self, "frame_start")
+        layout.prop(self, "frame_end")
+        layout.prop(self, "step")
+        layout.separator()
+        layout.label(text="Tip: MD2 files often have 1000+ frames.", icon="INFO")
+        layout.label(text="Use Start/End to import one animation.")
+
+    def execute(self, context):
+        import os
+        filepath = self.filepath
+        ext = os.path.splitext(filepath)[1].lower()
+
+        try:
+            if ext == ".mdl":
+                data = _read_mdl(filepath)
+                is_md2 = False
+            elif ext == ".md2":
+                data = _read_md2(filepath)
+                is_md2 = True
+            else:
+                self.report({"ERROR"}, f"Unsupported file type: {ext}. Use .mdl or .md2")
+                return {"CANCELLED"}
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to read file: {e}")
+            return {"CANCELLED"}
+
+        total_frames = len(data["frames"])
+        fs = self.frame_start
+        fe = self.frame_end if self.frame_end > 0 else total_frames - 1
+        fe = min(fe, total_frames - 1)
+        step = max(1, self.step)
+
+        frame_indices = list(range(fs, fe + 1, step))
+        if len(frame_indices) < 2:
+            self.report({"ERROR"}, f"Need at least 2 frames. File has {total_frames} frames total.")
+            return {"CANCELLED"}
+        if len(frame_indices) > 2000:
+            self.report({"ERROR"}, f"Too many frames ({len(frame_indices)}). Increase Step or reduce range. Max 2000.")
+            return {"CANCELLED"}
+
+        numverts = data["numverts"]
+        tris = data["tris"]
+
+        # Build basis vertex positions (first selected frame)
+        if is_md2:
+            f0 = data["frames"][frame_indices[0]]
+            basis_cos = _quake_md2_frame_cos(
+                f0["verts"], f0["scale"], f0["translate"]
+            )
+        else:
+            basis_cos = _quake_mdl_to_rf_cos(
+                data["frames"][frame_indices[0]],
+                data["scale"], data["scale_origin"]
+            )
+
+        # Build mesh from basis frame
+        mesh = bpy.data.meshes.new(os.path.splitext(os.path.basename(filepath))[0])
+        verts_3d = [(basis_cos[i*3], basis_cos[i*3+1], basis_cos[i*3+2])
+                    for i in range(numverts)]
+        mesh.from_pydata(verts_3d, [], tris)
+        mesh.update()
+
+        obj = bpy.data.objects.new(mesh.name, mesh)
+
+        # Add to RF_VFX collection if it exists, else scene collection
+        scene = context.scene
+        col = None
+        cname = scene.get("rfvfx_export_collection", "RF_VFX")
+        col = bpy.data.collections.get(cname)
+        if col is None:
+            col = context.scene.collection
+        col.objects.link(obj)
+        bpy.ops.object.select_all(action="DESELECT")
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        # Add UV layer (placeholder — Quake UV data needs skin texture)
+        mesh.uv_layers.new(name="UVMap")
+
+        # Build shape keys — Basis + one per selected frame
+        basis_sk = obj.shape_key_add(name="Basis", from_mix=False)
+        basis_sk.data.foreach_set("co", basis_cos)
+
+        scene_frame_start = context.scene.frame_start
+        created = 0
+        for fi, frame_idx in enumerate(frame_indices[1:], start=1):
+            if is_md2:
+                fr = data["frames"][frame_idx]
+                cos = _quake_md2_frame_cos(fr["verts"], fr["scale"], fr["translate"])
+            else:
+                cos = _quake_mdl_to_rf_cos(
+                    data["frames"][frame_idx],
+                    data["scale"], data["scale_origin"]
+                )
+
+            fname = data["frame_names"][frame_idx] if data["frame_names"][frame_idx] else f"Frame_{frame_idx:04d}"
+            sk = obj.shape_key_add(name=fname, from_mix=False)
+            sk.data.foreach_set("co", cos)
+            sk.value = 0.0
+            created += 1
+
+        # Wire up RF constant-interpolation keyframes
+        me = obj.data
+        if me.shape_keys and created > 0:
+            me.shape_keys.use_relative = True
+            all_keys = me.shape_keys.key_blocks
+            baked_end = scene_frame_start + created
+            for ki in range(1, len(all_keys)):
+                sk = all_keys[ki]
+                target_frame = scene_frame_start + ki
+                sk.value = 0.0
+                sk.keyframe_insert(data_path="value", frame=target_frame - 1)
+                sk.value = 1.0
+                sk.keyframe_insert(data_path="value", frame=target_frame)
+                sk.value = 0.0
+                if target_frame < baked_end:
+                    sk.keyframe_insert(data_path="value", frame=target_frame + 1)
+                sk.value = 0.0
+                try:
+                    act = me.shape_keys.animation_data.action if me.shape_keys.animation_data else None
+                    if act:
+                        dp = f'key_blocks["{sk.name}"].value'
+                        fcs = getattr(act, "fcurves", None)
+                        if not fcs:
+                            for layer in getattr(act, "layers", []):
+                                for strip in getattr(layer, "strips", []):
+                                    fcs = getattr(strip, "channels", None)
+                                    if fcs: break
+                                if fcs: break
+                        if fcs:
+                            for fc in fcs:
+                                if getattr(fc, "data_path", "") == dp:
+                                    for kp in fc.keyframe_points:
+                                        kp.interpolation = "CONSTANT"
+                except Exception:
+                    pass
+
+            context.scene.frame_end = baked_end
+
+        # Mark for RF export
+        try:
+            obj["rfvfx_export"] = 1
+        except Exception:
+            pass
+
+        self.report(
+            {"INFO"},
+            f"Imported {os.path.basename(filepath)}: {numverts} verts, "
+            f"{created} shape keys (frames {fs}–{fe}, step={step}). "
+            f"Assign a texture in the Materials panel, then Export VFX."
+        )
+        return {"FINISHED"}
+
+
 class RFVFX_OT_ReadinessCheck(bpy.types.Operator):
     bl_idname = "rfvfx.readiness_check"
     bl_label = "Readiness Check"
@@ -2776,6 +3228,10 @@ class RFVFX_OT_ReadinessCheck(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
+        col = _get_export_collection(scene)
+        if col is None:
+            self.report({"ERROR"}, "No RF_VFX collection found. Click 'New RF VFX Scene' first.")
+            return {"CANCELLED"}
         objs = _export_objs(scene)
 
         errors = []
@@ -2783,6 +3239,8 @@ class RFVFX_OT_ReadinessCheck(bpy.types.Operator):
 
         if not objs:
             errors.append("No export objects found. Use 'New RF VFX Scene' then 'Add Selected To RF_VFX'.")
+        elif not any(o.type == "MESH" for o in objs):
+            errors.append("RF_VFX has no mesh objects — nothing to export.")
 
         # end_frame note: the exporter auto-clamps end_frame to >= 5 for all exports.
         # No need to check here — it's enforced at export time.
@@ -3337,9 +3795,6 @@ class RFVFX_PT_Workflows(bpy.types.Panel):
         layout.operator("rfvfx.write_authoring_guide", text="Open Full Guide", icon="HELP")
         layout.separator()
 
-        col = layout.column(align=True)
-        col.scale_y = 0.82
-
         # ── Create ──
         box = layout.box()
         b = box.column(align=True)
@@ -3365,28 +3820,33 @@ class RFVFX_PT_Workflows(bpy.types.Panel):
         b3 = box3.column(align=True)
         b3.scale_y = 0.82
         b3.label(text="MORPH ANIMATION", icon="SHAPEKEY_DATA")
-        b3.label(text="  Option A — Custom animation:")
-        b3.label(text="    1. Animate mesh (shape keys, modifiers)")
-        b3.label(text="    2. Click 'Bake Animation to Shape Keys'")
-        b3.label(text="  Option B — Mixamo / rigged mesh:")
-        b3.label(text="    1. Import Mixamo FBX, select mesh or armature")
-        b3.label(text="    2. Click 'Armature → Shape Keys (Mixamo)'")
-        b3.label(text="  Option C — Quake / pre-keyed shapes:")
-        b3.label(text="    1. Import model with existing shape keys")
-        b3.label(text="    2. Click 'Shape Keys → RF Timing (Quake)'")
-        b3.label(text="  Then for all options:")
-        b3.label(text="    Set Morph FPS → Export VFX")
+        b3.label(text="  1. Animate mesh (shape keys, modifiers, etc.)")
+        b3.label(text="  2. Click 'Bake Animation to Shape Keys'")
+        b3.label(text="  3. Set Morph FPS in Advanced Options")
+        b3.label(text="     5fps \u2192 cloth, foliage  (smooth, less RAM)")
+        b3.label(text="     15fps \u2192 explosions, impacts")
+        b3.label(text="  4. Click 'Export VFX'")
 
-        # ── Particles ──
+        # ── Import map reference ──
         box4 = layout.box()
         b4 = box4.column(align=True)
         b4.scale_y = 0.82
-        b4.label(text="ADD PARTICLES", icon="PARTICLES")
-        b4.label(text="  1. Particles panel \u2192 Click 'New Emitter'")
-        b4.label(text="  2. Position + rotate the arrow")
-        b4.label(text="     Arrow tip = emit direction")
-        b4.label(text="  3. Set texture + adjust settings")
-        b4.label(text="  4. Export  (included automatically)")
+        b4.label(text="IMPORT MAP REFERENCE", icon="MESH_DATA")
+        b4.label(text="  Import RFG or WRL to use as a reference")
+        b4.label(text="  when building VFX for a specific map location.")
+        b4.label(text="  New VFX / Import panel \u2192 Import RFG or WRL")
+        b4.label(text="  Tick 'Import at Origin' for VFX building.")
+
+        # ── Particles ──
+        box5 = layout.box()
+        b5 = box5.column(align=True)
+        b5.scale_y = 0.82
+        b5.label(text="ADD PARTICLES", icon="PARTICLES")
+        b5.label(text="  1. Particles panel \u2192 Click 'New Emitter'")
+        b5.label(text="  2. Position + rotate the arrow")
+        b5.label(text="     Arrow tip = emit direction")
+        b5.label(text="  3. Set texture + adjust settings")
+        b5.label(text="  4. Export  (included automatically)")
 
 
 class RFVFX_PT_ImportScene(bpy.types.Panel):
@@ -3410,6 +3870,8 @@ class RFVFX_PT_ImportScene(bpy.types.Panel):
             col.separator()
             col.operator("rfvfx.import_vfx", text="Import VFX...", icon="IMPORT")
             col.operator("rfvfx.import_rfg", text="Import RFG Map...", icon="MESH_DATA")
+            col.operator("rfvfx.import_wrl", text="Import RED VRML Map...", icon="WORLD")
+            col.operator("rfvfx.import_quake_model", text="Import Quake Model (MDL/MD2)...", icon="OBJECT_DATA")
 
             if s.import_vfx.strip():
                 import os as _os
@@ -3438,10 +3900,12 @@ def _rfg_read_vstring(f):
     return f.read(length).decode("ascii", errors="replace")
 
 def _rfg_rf_to_blender(rx, ry, rz):
-    """RF Y-up left-handed → Blender Z-up right-handed.
-    rf_to_blender(rx, ry, rz) = (-rz, -rx, ry)
-    Inverse of blender_to_rf(bx,by,bz) = (-by, bz, -bx)."""
-    return (-rz, -rx, ry)
+    """RF Y-up → Blender Z-up direct (no glTF intermediary).
+    RFG import builds bmesh directly, so we apply the full
+    RF→Blender conversion here: (-rx, -rz, ry). This is equivalent
+    to (negate-X to glTF Y-up RH) composed with (Y-up→Z-up rotation).
+    Aligned with RF Static Mesh Tools and RF Character Tools."""
+    return (-rx, -rz, ry)
 
 def _rfg_parse(filepath):
     """Parse an RFG file and return a list of brush dicts.
@@ -3463,8 +3927,10 @@ def _rfg_parse(filepath):
         version = _struct.unpack("<i", f.read(4))[0]
         num_groups = _struct.unpack("<i", f.read(4))[0]
 
-        is_rf1 = (version >= 0x12C) or (version <= 0xC8)
-        is_rf2 = (version == 0x127)
+        # RF1 RFG versions range from 0xC8 (200) to 0x12C (300)
+        # All known RFG files from RF1 use RF1 format
+        is_rf1 = True
+        is_rf2 = False
 
         for _g in range(num_groups):
 
@@ -3485,16 +3951,20 @@ def _rfg_parse(filepath):
                 # ── Brush UID ──
                 brush["uid"] = _struct.unpack("<i", f.read(4))[0]
 
+                # ── Unknown 4 bytes after UID (flags/life field) ──
+                f.read(4)
+
                 # ── Position ──
                 px, py, pz = _struct.unpack("<3f", f.read(12))
                 brush["position"] = _rfg_rf_to_blender(px, py, pz)
+
+                # ── 1 byte before rotation (modifiability flag) ──
+                f.read(1)
 
                 # ── Rotation matrix (fwd, right, up — each a 3-float row) ──
                 fwd   = _struct.unpack("<3f", f.read(12))
                 right = _struct.unpack("<3f", f.read(12))
                 up    = _struct.unpack("<3f", f.read(12))
-                # Build 3x3 in RF space, then convert each basis vector
-                # RF matrix layout in redux: row0=right, row1=up, row2=fwd
                 brush["rotation"] = (right, up, fwd)
 
                 # ── Geometry body ──
@@ -3739,43 +4209,24 @@ def _rfg_parse(filepath):
     return brushes
 
 
-def _rfg_build_mesh(brush, collection, merge_brushes=False):
+def _rfg_build_mesh(brush, collection, import_at_origin=False):
     """Build a Blender mesh object from a parsed RFG brush dict.
     Returns the created object."""
-    import mathutils
 
     textures = brush["textures"]
     faces = brush["faces"]
     if not faces:
         return None
 
-    # Collect unique vertices (world-space) and build index map
-    # Each face has its own vert list in RF local space — transform to world first
-    rx, ry, rz = brush["rotation"]  # (right, up, fwd) each in RF space
-    pos = brush["position"]         # already in Blender space
-
-    # Convert rotation basis vectors to Blender space
-    # Each row in RF is a direction vector — apply rf_to_blender to each
-    def _conv(v):
-        return _rfg_rf_to_blender(v[0], v[1], v[2])
-
-    bl_right = _conv(rx)
-    bl_up    = _conv(ry)
-    bl_fwd   = _conv(rz)
-
-    # Build 3x3 rotation matrix (col-major: each column is a basis vector)
-    rot_mat = mathutils.Matrix((
-        (bl_right[0], bl_up[0], bl_fwd[0]),
-        (bl_right[1], bl_up[1], bl_fwd[1]),
-        (bl_right[2], bl_up[2], bl_fwd[2]),
-    ))
+    pos = brush["position"]  # brush world origin already in Blender space
+    use_pos = not import_at_origin
 
     def transform_vert(rv):
-        """Transform RF local vert to Blender world space."""
+        """Convert RF local-space vert to Blender world space."""
         bv = _rfg_rf_to_blender(rv[0], rv[1], rv[2])
-        local = mathutils.Vector(bv)
-        world = rot_mat @ local + mathutils.Vector(pos)
-        return (world.x, world.y, world.z)
+        if use_pos:
+            return (bv[0] + pos[0], bv[1] + pos[1], bv[2] + pos[2])
+        return bv
 
     # Build flat vert/face lists for bmesh
     verts = []
@@ -3856,6 +4307,230 @@ def _rfg_build_mesh(brush, collection, merge_brushes=False):
     return obj
 
 
+# ── WRL IMPORTER ──────────────────────────────────────────────────────────────
+
+def _wrl_parse(filepath):
+    """Parse a VRML 2.0 file exported from RED Editor.
+    Returns (shapes, export_type) where shapes is a list of dicts:
+      {name, vertices [(x,y,z)...], faces [(i,j,k...)...], color (r,g,b)}
+    export_type is 'web_browser' or '3ds_max'.
+    """
+    import re as _re
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    if not content.lstrip().startswith("#VRML V2.0"):
+        raise ValueError("Not a VRML 2.0 file")
+
+    export_type = "3ds_max" if "scale 39.21569" in content else "web_browser"
+
+    shape_re = _re.compile(
+        r"Shape\s*\{.*?"
+        r"diffuseColor\s+([\d.]+)\s+([\d.]+)\s+([\d.]+).*?"
+        r"geometry\s+DEF\s+(\S+)-FACES\s+IndexedFaceSet\s*\{.*?"
+        r"point\s*\[(.*?)\].*?"
+        r"coordIndex\s*\[(.*?)\]",
+        _re.DOTALL
+    )
+
+    shapes = []
+    for m in shape_re.finditer(content):
+        r, g, b = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        name = m.group(4)
+        pts_raw = m.group(5).strip()
+        idx_raw = m.group(6).strip()
+
+        if not pts_raw or not idx_raw:
+            continue
+
+        verts = []
+        for line in pts_raw.split("\n"):
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    verts.append((float(parts[0]), float(parts[1]), float(parts[2])))
+                except ValueError:
+                    pass
+
+        faces = []
+        for face_str in idx_raw.split("-1"):
+            indices = []
+            for tok in face_str.replace(",", " ").split():
+                tok = tok.strip()
+                if tok:
+                    try:
+                        indices.append(int(tok))
+                    except ValueError:
+                        pass
+            if len(indices) >= 3:
+                faces.append(tuple(indices))
+
+        if verts and faces:
+            shapes.append({"name": name, "vertices": verts,
+                           "faces": faces, "color": (r, g, b)})
+
+    return shapes, export_type
+
+
+class RFVFX_OT_ImportWRL(bpy.types.Operator):
+    bl_idname = "rfvfx.import_wrl"
+    bl_label = "Import RED VRML Map..."
+    bl_description = (
+        "Import level geometry exported from RED Editor as VRML (.wrl). "
+        "Handles RF coordinate conversion automatically. "
+        "Use RED: File > Export > VRML to generate the file."
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(subtype="FILE_PATH")
+    filter_glob: StringProperty(default="*.wrl", options={"HIDDEN"})
+
+    merge_by_texture: BoolProperty(
+        name="Merge Shapes by Color",
+        default=False,
+        description=(
+            "Merge all shapes that share the same diffuseColor into one mesh. "
+            "WRL files from RED use color per brush, so this reduces object count."
+        )
+    )
+    import_into_rf_vfx: BoolProperty(
+        name="Import into RF_VFX Collection",
+        default=False,
+        description=(
+            "Place imported geometry into the RF_VFX export collection. "
+            "Leave off to import into a separate WRL collection for reference only."
+        )
+    )
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "merge_by_texture")
+        layout.separator()
+        layout.prop(self, "import_into_rf_vfx")
+
+    def execute(self, context):
+        filepath = bpy.path.abspath(self.filepath).strip()
+        if not filepath or not os.path.isfile(filepath):
+            self.report({"ERROR"}, "Pick a valid .wrl file.")
+            return {"CANCELLED"}
+
+        try:
+            shapes, export_type = _wrl_parse(filepath)
+        except Exception as e:
+            self.report({"ERROR"}, f"WRL parse failed: {e}")
+            return {"CANCELLED"}
+
+        if not shapes:
+            self.report({"WARNING"}, "No geometry found in WRL file.")
+            return {"CANCELLED"}
+
+        # Target collection
+        if self.import_into_rf_vfx:
+            col = bpy.data.collections.get("RF_VFX")
+            if col is None:
+                col = bpy.data.collections.new("RF_VFX")
+                context.scene.collection.children.link(col)
+        else:
+            base = os.path.splitext(os.path.basename(filepath))[0]
+            col_name = f"WRL_{base}"
+            col = bpy.data.collections.get(col_name)
+            if col is None:
+                col = bpy.data.collections.new(col_name)
+                context.scene.collection.children.link(col)
+
+        import bmesh as _bmesh
+
+        def _wrl_vert_to_blender(x, y, z):
+            # WRL from RED stores verts as (RF_X, RF_Z, -RF_Y)
+            # so: RF_X=x, RF_Y=-z, RF_Z=y
+            # Apply new rf_to_blender(-rx,-rz,ry):
+            # = (-RF_X, -RF_Z, RF_Y) = (-x, -y, -z)
+            return (-x, -y, -z)
+
+        def _make_mesh(name, verts_raw, faces, color):
+            verts = [_wrl_vert_to_blender(*v) for v in verts_raw]
+            mesh = bpy.data.meshes.new(name + "_mesh")
+            obj = bpy.data.objects.new(name, mesh)
+            col.objects.link(obj)
+
+            bm = _bmesh.new()
+            bm_verts = [bm.verts.new(v) for v in verts]
+            bm.verts.ensure_lookup_table()
+            skipped = 0
+            for face_indices in faces:
+                try:
+                    # WRL stores CW; the new RF↔Blender conversion has det=-1,
+                    # so the coord transform already flips winding to CCW for Blender.
+                    bm.faces.new([bm_verts[i] for i in face_indices])
+                except (IndexError, ValueError):
+                    skipped += 1
+            bm.to_mesh(mesh)
+            bm.free()
+            mesh.update()
+
+            mat = bpy.data.materials.new(name + "_mat")
+            mat.use_nodes = True
+            mat.use_backface_culling = False
+            bsdf = mat.node_tree.nodes.get("Principled BSDF")
+            if bsdf:
+                bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+                bsdf.inputs["Roughness"].default_value = 0.8
+            mesh.materials.append(mat)
+            return obj, skipped
+
+        total_verts = 0
+        total_faces = 0
+        total_skipped = 0
+        created = 0
+
+        if self.merge_by_texture:
+            # Group by color
+            color_map = {}
+            for shape in shapes:
+                key = (round(shape["color"][0]*1000),
+                       round(shape["color"][1]*1000),
+                       round(shape["color"][2]*1000))
+                if key not in color_map:
+                    color_map[key] = {"verts": [], "faces": [], "color": shape["color"]}
+                offset = len(color_map[key]["verts"])
+                color_map[key]["verts"].extend(shape["vertices"])
+                for face in shape["faces"]:
+                    color_map[key]["faces"].append(tuple(i + offset for i in face))
+
+            for ki, (key, data) in enumerate(color_map.items()):
+                name = f"WRL_color_{ki:03d}"
+                obj, skipped = _make_mesh(name, data["verts"], data["faces"], data["color"])
+                total_verts += len(data["verts"])
+                total_faces += len(data["faces"])
+                total_skipped += skipped
+                created += 1
+        else:
+            for shape in shapes:
+                obj, skipped = _make_mesh(shape["name"], shape["vertices"],
+                                          shape["faces"], shape["color"])
+                total_verts += len(shape["vertices"])
+                total_faces += len(shape["faces"])
+                total_skipped += skipped
+                created += 1
+
+        msg = (
+            f"Imported {created} object(s) from {os.path.basename(filepath)} "
+            f"[{export_type}]: {total_verts} verts, {total_faces} faces."
+        )
+        if total_skipped:
+            msg += f" {total_skipped} degenerate faces skipped."
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
 class RFVFX_OT_ImportRFG(bpy.types.Operator):
     bl_idname = "rfvfx.import_rfg"
     bl_label = "Import RFG Map..."
@@ -3891,6 +4566,15 @@ class RFVFX_OT_ImportRFG(bpy.types.Operator):
             "Leave off to import into a separate RFG collection for reference only."
         )
     )
+    import_at_origin: BoolProperty(
+        name="Import at Origin",
+        default=False,
+        description=(
+            "Ignore brush world positions and import all geometry centred at the Blender origin. "
+            "Useful when importing a single brush as a VFX reference — avoids it appearing "
+            "thousands of units away from the origin. Leave off for full map imports."
+        )
+    )
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
@@ -3902,6 +4586,7 @@ class RFVFX_OT_ImportRFG(bpy.types.Operator):
         layout.prop(self, "skip_invisible")
         layout.separator()
         layout.prop(self, "import_into_rf_vfx")
+        layout.prop(self, "import_at_origin")
 
     def execute(self, context):
         filepath = bpy.path.abspath(self.filepath).strip()
@@ -3936,25 +4621,13 @@ class RFVFX_OT_ImportRFG(bpy.types.Operator):
 
         if self.merge_by_texture:
             # Collect all faces grouped by texture name across all brushes
-            import mathutils
             tex_faces = {}   # tex_name -> list of (world_verts, uvs)
             all_textures = set()
 
+            use_pos = not self.import_at_origin
             for brush in brushes:
                 textures = brush["textures"]
-                rx, ry, rz = brush["rotation"]
-                pos = brush["position"]
-
-                def _conv(v):
-                    return _rfg_rf_to_blender(v[0], v[1], v[2])
-                bl_right = _conv(rx)
-                bl_up    = _conv(ry)
-                bl_fwd   = _conv(rz)
-                rot_mat = mathutils.Matrix((
-                    (bl_right[0], bl_up[0], bl_fwd[0]),
-                    (bl_right[1], bl_up[1], bl_fwd[1]),
-                    (bl_right[2], bl_up[2], bl_fwd[2]),
-                ))
+                pos = brush["position"]  # brush world origin in Blender space
 
                 for face in brush["faces"]:
                     tidx = face["texture_idx"]
@@ -3964,9 +4637,10 @@ class RFVFX_OT_ImportRFG(bpy.types.Operator):
                     world_verts = []
                     for rv in face["verts"]:
                         bv = _rfg_rf_to_blender(rv[0], rv[1], rv[2])
-                        local = mathutils.Vector(bv)
-                        world = rot_mat @ local + mathutils.Vector(pos)
-                        world_verts.append((world.x, world.y, world.z))
+                        if use_pos:
+                            world_verts.append((bv[0] + pos[0], bv[1] + pos[1], bv[2] + pos[2]))
+                        else:
+                            world_verts.append(bv)
 
                     if tex_name not in tex_faces:
                         tex_faces[tex_name] = []
@@ -4028,7 +4702,7 @@ class RFVFX_OT_ImportRFG(bpy.types.Operator):
             # One object per brush
             created = 0
             for brush in brushes:
-                obj = _rfg_build_mesh(brush, col)
+                obj = _rfg_build_mesh(brush, col, import_at_origin=self.import_at_origin)
                 if obj:
                     created += 1
 
@@ -4317,11 +4991,7 @@ class RFVFX_PT_Particles(bpy.types.Panel):
         # --- Physics ---
         box6 = layout.box()
         box6.label(text="Physics", icon="PHYSICS")
-        row_g = box6.row(align=True)
-        row_g.prop(pp, "apply_gravity", text="Gravity")
-        sub_g = row_g.row()
-        sub_g.enabled = pp.apply_gravity
-        sub_g.prop(pp, "gravity_strength", text="")
+        box6.prop(pp, "apply_gravity", text="Gravity  (on/off)")
 
         # --- Size / Fade ---
         box7 = layout.box()
@@ -4349,9 +5019,15 @@ class RFVFX_PT_ExportPanel(bpy.types.Panel):
         layout.prop(s, "vfx_name", text="Name")
         layout.prop(s, "export_vfx_out", text="Output")
 
-        has_template = bool(s.last_import_vfx.strip())
+        has_template = bool(s.last_import_vfx.strip() or s.export_template_vfx.strip())
         if has_template:
-            layout.label(text="Patch mode — editing imported VFX", icon="FILE_TICK")
+            tmpl_name = ""
+            import os as _os2
+            if s.export_template_vfx.strip():
+                tmpl_name = _os2.path.basename(bpy.path.abspath(s.export_template_vfx))
+            elif s.last_import_vfx.strip():
+                tmpl_name = _os2.path.basename(bpy.path.abspath(s.last_import_vfx))
+            layout.label(text=f"Patch mode: {tmpl_name}" if tmpl_name else "Patch mode — template set", icon="FILE_TICK")
 
         layout.separator()
 
@@ -4365,9 +5041,9 @@ class RFVFX_PT_ExportPanel(bpy.types.Panel):
             col_p.scale_y = 1.0
             col_p.operator("rfvfx.bake_anim_to_shape_keys", text="Bake Animation to Shape Keys", icon="SHAPEKEY_DATA")
             col_p.separator()
-            col_p.label(text="One-Click Converters:", icon="FORWARD")
-            col_p.operator("rfvfx.armature_to_shape_keys", text="Armature → Shape Keys (Mixamo)", icon="ARMATURE_DATA")
-            col_p.operator("rfvfx.keyed_shapes_to_rf_timing", text="Shape Keys → RF Timing (Quake)", icon="KEYFRAME_HLT")
+            col_p.label(text="Rigged / Pre-keyed Mesh Converters:", icon="FORWARD")
+            col_p.operator("rfvfx.armature_to_shape_keys", text="Bake Rigged Mesh → Shape Keys", icon="ARMATURE_DATA")
+            col_p.operator("rfvfx.keyed_shapes_to_rf_timing", text="Wire RF Timing on Existing Shape Keys", icon="KEYFRAME_HLT")
             col_p.separator()
             col_p.operator("rfvfx.readiness_check", text="Readiness Check", icon="VIEWZOOM")
             col_p.operator("rfvfx.arrange_scene", text="Select and Frame All", icon="RESTRICT_SELECT_OFF")
@@ -4381,7 +5057,10 @@ class RFVFX_PT_ExportPanel(bpy.types.Panel):
             box.prop(s, "export_mode", text="Mode")
             col = box.column(align=True)
             col.prop(s, "double_sided")
-            col.prop(s, "fix_winding", text="Flip Faces")
+            box.separator()
+            row_anchor = box.row(align=True)
+            row_anchor.label(text="Anchor:", icon="EMPTY_AXIS")
+            row_anchor.prop_search(s, "export_anchor", context.scene, "objects", text="")
             box.separator()
             row_fps = box.row(align=True)
             row_fps.label(text="Morph FPS:", icon="MOD_WARP")
@@ -4410,16 +5089,145 @@ class RFVFX_PT_ExportPanel(bpy.types.Panel):
         row.operator("rfvfx.export_vfx", text="Export VFX", icon="EXPORT")
 
 
+def _get_template_dir():
+    """Return the path where the RF VFX app template should be installed."""
+    import os
+    templates_dir = bpy.utils.user_resource("SCRIPTS", path="startup/bl_app_templates_user")
+    return os.path.join(templates_dir, "RF_VFX")
+
+def _install_app_template():
+    """Write the RF VFX app template files to the Blender user scripts folder."""
+    import os
+    template_dir = _get_template_dir()
+    os.makedirs(template_dir, exist_ok=True)
+
+    # startup.py — runs when the template is loaded via File > New
+    startup_py = '''\
+import bpy
+
+def setup_rf_vfx_scene():
+    scene = bpy.context.scene
+
+    # Remove everything in the default scene
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete(use_global=True)
+
+    # Remove all default collections except the master scene collection
+    for col in list(bpy.data.collections):
+        try:
+            scene.collection.children.unlink(col)
+        except Exception:
+            pass
+        bpy.data.collections.remove(col)
+
+    # Remove leftover meshes/objects from default scene
+    for block in list(bpy.data.meshes):
+        bpy.data.meshes.remove(block)
+    for block in list(bpy.data.lights):
+        bpy.data.lights.remove(block)
+    for block in list(bpy.data.cameras):
+        bpy.data.cameras.remove(block)
+
+    # Create RF_VFX collection
+    rf_col = bpy.data.collections.new("RF_VFX")
+    scene.collection.children.link(rf_col)
+
+    # Create RFVFX_ROOT dummy
+    root = bpy.data.objects.new("RFVFX_ROOT", None)
+    root.empty_display_type = "ARROWS"
+    root.empty_display_size = 0.4
+    root["rfvfx_is_dummy"] = 1
+    rf_col.objects.link(root)
+
+    # Scene settings
+    scene["rfvfx_export_collection"] = "RF_VFX"
+    scene["rfvfx_root_dummy"] = "RFVFX_ROOT"
+    try:
+        scene.unit_settings.system = "METRIC"
+        scene.unit_settings.scale_length = 1.0
+    except Exception:
+        pass
+
+    # Name the scene
+    scene.name = "RF_VFX_Scene"
+
+    # Select root
+    bpy.ops.object.select_all(action="DESELECT")
+    root.select_set(True)
+    bpy.context.view_layer.objects.active = root
+
+setup_rf_vfx_scene()
+'''
+
+    startup_path = os.path.join(template_dir, "startup.py")
+    with open(startup_path, "w", encoding="utf-8") as f:
+        f.write(startup_py)
+
+    # __init__.py required by Blender to recognise the template folder
+    init_path = os.path.join(template_dir, "__init__.py")
+    if not os.path.exists(init_path):
+        with open(init_path, "w", encoding="utf-8") as f:
+            f.write("# RF VFX App Template\n")
+
+    return template_dir
+
+def _uninstall_app_template():
+    """Remove the RF VFX app template folder."""
+    import os, shutil
+    template_dir = _get_template_dir()
+    if os.path.isdir(template_dir):
+        shutil.rmtree(template_dir)
+
+
+class RFVFX_OT_InstallTemplate(bpy.types.Operator):
+    bl_idname = "rfvfx.install_template"
+    bl_label = "Install RF VFX Scene Template"
+    bl_description = (
+        "Installs an 'RF VFX' entry in File > New. "
+        "After installing, use File > New > RF VFX to start a clean scene "
+        "with RF_VFX collection and RFVFX_ROOT already set up."
+    )
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        try:
+            path = _install_app_template()
+            self.report({"INFO"}, f"RF VFX template installed. Restart Blender, then use File > New > RF VFX.")
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to install template: {e}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class RFVFX_OT_UninstallTemplate(bpy.types.Operator):
+    bl_idname = "rfvfx.uninstall_template"
+    bl_label = "Uninstall RF VFX Scene Template"
+    bl_description = "Removes the RF VFX entry from File > New."
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        try:
+            _uninstall_app_template()
+            self.report({"INFO"}, "RF VFX template removed. Restart Blender to apply.")
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to remove template: {e}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 _authoring_classes = [
     RFVFX_ObjectProps,
     RFVFX_MaterialProps,
     RFVFX_ParticleProps,
+    RFVFX_OT_InstallTemplate,
+    RFVFX_OT_UninstallTemplate,
     RFVFX_OT_NewAuthoringScene,
     RFVFX_OT_AddSelectedToRF,
     RFVFX_OT_ArrangeScene,
     RFVFX_OT_BakeAnimToShapeKeys,
     RFVFX_OT_ArmatureToShapeKeys,
     RFVFX_OT_KeyedShapesToRFTiming,
+    RFVFX_OT_ImportQuakeModel,
     RFVFX_OT_ReadinessCheck,
     RFVFX_OT_ExportAuthoringGLTF,
     RFVFX_OT_WriteAuthoringGuide,
@@ -4437,6 +5245,7 @@ _authoring_classes = [
     RFVFX_OT_BrowseMaterialTexture,
     RFVFX_OT_BrowseMaterialTextureSlot,
     RFVFX_OT_ImportRFG,
+    RFVFX_OT_ImportWRL,
     RFVFX_PT_Workflows,
     RFVFX_PT_ImportScene,
     RFVFX_PT_Materials,
@@ -4486,18 +5295,21 @@ def _authoring_unregister():
             pass
     _authoring_registered = False
 
-# Wrap existing addon register/unregister without deleting anything
-try:
-    _rfvfx_old_register = register
-    _rfvfx_old_unregister = unregister
+# Re-define register/unregister to include both base and authoring classes
+def register():
+    for c in _classes:
+        bpy.utils.register_class(c)
+    bpy.types.Scene.rfvfx = PointerProperty(type=RFVFX_Settings)
+    _authoring_register()
 
-    def register():
-        _rfvfx_old_register()
-        _authoring_register()
-
-    def unregister():
-        _authoring_unregister()
-        _rfvfx_old_unregister()
-except Exception as _e:
-    # If the base addon doesn't have register yet, do nothing.
-    pass
+def unregister():
+    _authoring_unregister()
+    try:
+        del bpy.types.Scene.rfvfx
+    except Exception:
+        pass
+    for c in reversed(_classes):
+        try:
+            bpy.utils.unregister_class(c)
+        except Exception:
+            pass

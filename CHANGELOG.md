@@ -4,6 +4,120 @@ All notable changes to RF VFX Tools are documented here.
 
 ---
 
+## v0.7.8 — 2026-05-07
+
+### Fixed
+- Vehicle and animation exports could be silently broken depending on
+  Blender's session state. Blender's operator system uses the last-used
+  UI value as the runtime default for `bpy.ops.export_scene.gltf`, so if
+  the "+Y Up" checkbox had ever been unticked in an export dialog this
+  session, scripted exports inherited that — vfx2obj got Z-up data and
+  produced files with axes scrambled in-game. `export_yup=True` is now
+  set explicitly at every export call site.
+
+---
+
+## v0.7.7 — 2026-05-07
+
+### Fixed
+- Imported VFX meshes appeared face-down on the floor in Blender instead
+  of standing upright. Root cause: Blender 4.x's glTF importer **always**
+  applies a Y-up → Z-up rotation, and the `import_yup` parameter older
+  builds passed to suppress that rotation no longer exists in current
+  Blender. The result was the up-axis swap happening twice — once in
+  vfx2obj, once in Blender's importer — leaving meshes lying on their
+  backs. The conversion pipeline now writes standard glTF Y-up data
+  (Redux convention: just negate X) and lets Blender's importer apply
+  its own up-axis rotation. The combined result places meshes in the
+  same Blender Z-up frame the V3M and Character tools use, so all three
+  add-ons now agree on orientation.
+
+### Changed
+- Quaternion conversion simplified to `(-qx, qy, qz, qw)` (Redux
+  convention, self-inverse). The old matrix-conjugation approach was
+  correct but unnecessary now that the pipeline uses Blender's importer
+  for the up-axis swap.
+- Removed the now-pointless `import_yup=False` and `export_yup=False`
+  arguments from glTF wrapper calls.
+
+### Internal
+- Triangle winding flip remains required (the negate-X step is a
+  reflection with det = -1) and is still wired in for both directions.
+- RFG and WRL importers were not affected — they build bmesh directly
+  without a glTF intermediary, so they kept their existing
+  `(-rx, -rz, ry)` direct conversion.
+
+---
+
+## v0.7.6 — 2026-05-07
+
+### Fixed
+- Quaternion conversion direction. With the V3M-aligned `_M` matrix
+  introduced in v0.7.5, the conjugation in `quat_rf_to_blender` was
+  using `M·R·M^T` when it should have been `M^T·R·M`. Roundtrips were
+  already correct because the inverse used the matching wrong direction,
+  but the rotation itself was reflected — particles and dummies fired
+  in mirrored directions in-game.
+
+### Internal
+- Verification suite added: position roundtrip preserves to 1e-16
+  precision, normalized quaternion roundtrip is exact (allowing for
+  q ≡ -q sign ambiguity), and rotation equivalence holds across
+  cardinal-axis and arbitrary test quats.
+
+---
+
+## v0.7.5 — 2026-05-07
+
+### Changed
+- Coordinate convention realigned to match RF Static Mesh Tools and
+  RF Character Tools. Previously the VFX add-on used `(-rz, -rx, ry)`
+  for RF → Blender; it now uses `(-rx, -rz, ry)` like the other tools.
+  Imported VFX content sits in the same orientation as imported V3M /
+  V3C content, so they can be combined in one scene without manual
+  rotation.
+- Triangle winding is now flipped on both import and export
+  (`_flip_gltf_winding_in_place` is invoked after vfx2obj writes glTF
+  on import, and before vfx2obj reads glTF on export). Required because
+  the new `_M` matrix has det = -1.
+
+### Fixed
+- RFG map import: brush coordinate formula corrected to `(-rz, -rx, ry)`,
+  brush world position now applied correctly to vertices.
+- RFG: added "Import at Origin" option for editing convenience (skips
+  the world-position translation).
+
+---
+
+## v0.7.4 — 2026-04-18
+
+### Added
+- "Bake Rigged Mesh → Shape Keys" operator: convert an armature-driven
+  animation into per-frame shape keys, suitable for VFX morph export.
+- "Wire RF Timing on Existing Shape Keys" operator: take a shape-keyed
+  mesh and apply RF-style timing curves (linear interpolation,
+  per-frame keys) without re-baking the geometry.
+- Quake MDL/MD2 importer for asset migration: reads classic Quake
+  assets with RF unit scaling (1/12 factor) so they slot into RF maps
+  at appropriate scale.
+- WRL terrain importer.
+
+### Internal
+- `Alpine_VFX` event type sketch drafted (not yet posted to Goober for
+  Alpine Faction integration).
+
+---
+
+## v0.7.3 — internal build, not released
+
+(Coordinate-convention experimentation that didn't ship.)
+
+---
+
+## v0.7.2 — internal build, not released
+
+(Refactoring pass, not released.)
+
 ## v0.7.1
 
 **Armature → Shape Keys (Mixamo / Rigged)**
