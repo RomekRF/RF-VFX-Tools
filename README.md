@@ -179,3 +179,8 @@ Full documentation is included in each release:
 ---
 
 *Created by Romek and Claude*
+
+<img width="324" height="882" alt="image" src="https://github.com/user-attachments/assets/c5f261a4-a61a-495c-b3eb-75542ea7143b" />
+<img width="297" height="653" alt="image" src="https://github.com/user-attachments/assets/1546b48e-ea12-410f-a5d3-88218b61276e" />
+<img width="2560" height="1440" alt="20260314_200324_CTF-Arsenalb1" src="https://github.com/user-attachments/assets/ac5e49a5-b5b7-47b9-9e29-3be2208267c1" />
+
