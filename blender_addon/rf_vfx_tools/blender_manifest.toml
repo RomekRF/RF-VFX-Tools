@@ -1,0 +1,24 @@
+schema_version = "1.0.0"
+
+id = "rf_vfx_tools"
+version = "0.7.8"
+name = "RF VFX Tools"
+tagline = "Create and edit Red Faction 1 .vfx files in Blender"
+maintainer = "RomekRF"
+type = "add-on"
+
+# Tags from the official Blender add-on tag list
+tags = ["Import-Export", "Mesh", "Animation"]
+
+blender_version_min = "4.2.0"
+
+# License of the add-on (SPDX identifier).
+license = [
+    "SPDX:MIT",
+]
+
+# Optional: the add-on's homepage / source.
+website = "https://github.com/RomekRF/VFX_Exporter"
+
+# No external Python dependencies — everything ships in vendor/.
+# No platforms restriction — pure-Python add-on works on all platforms.
