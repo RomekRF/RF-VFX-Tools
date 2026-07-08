@@ -80,74 +80,29 @@ class Bin:
         return s
 
 # ----------------------------
-# RF ↔ glTF Y-up RH conversion (Redux convention)
-# RF: X=side, Y=up, Z=forward (left-handed Y-up)
-# glTF: X=right, Y=up, Z=forward (right-handed Y-up — same axes, opposite handedness)
-# Conversion is just "negate X" (Redux's RfToRh).
-#
-# Blender's glTF importer then applies Y-up→Z-up automatically. The combined
-# effect places mesh data in the V3M-tool-aligned Blender Z-up frame.
-#
-# Note: these functions are still named *_blender for compatibility with
-# call sites that predate this design. They produce glTF-space data that
-# Blender's importer will then rotate.
-# det(M) = -1 → triangle winding flips on round-trip (handled separately).
+# RF stored basis -> Blender basis
+# vfx.ksy vec3:
+#   stored.x = -max.x
+#   stored.y =  max.z
+#   stored.z = -max.y
+# so max/blender:
+#   x = -stored.x
+#   y = -stored.z
+#   z =  stored.y
 # ----------------------------
 
 def rf_to_blender(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """RF (left-handed Y-up) → glTF (right-handed Y-up). Just negate X."""
     sx, sy, sz = v
-    return (-sx, sy, sz)
+    return (-sx, -sz, sy)
 
 
 def blender_to_rf(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """glTF (right-handed Y-up) → RF (left-handed Y-up). Self-inverse."""
     bx, by, bz = v
-    return (-bx, by, bz)
-
-# --- glTF vertex-space <-> RF conversions ---
-# Blender's glTF exporter keeps vertex/node data in Blender Z-up space.
-# With export_yup=False, ALL glTF data stays in Blender Z-up space.
-# No vertex/TRS split — everything uses the same blender_to_rf conversion.
-# With import_yup=False, imported glTF data also stays Z-up.
-
-def gltf_vert_to_rf(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """Convert glTF vertex data to RF. With export_yup=False, data is Z-up."""
-    return blender_to_rf(v)
-
-def rf_to_gltf_vert(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """Convert RF position to glTF vertex space (Z-up with import_yup=False)."""
-    return rf_to_blender(v)
-
-def gltf_trs_to_rf(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """Convert glTF node translation to RF. With export_yup=False, data is Z-up."""
-    return blender_to_rf(v)
-
-def rf_to_gltf_trs(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """Convert RF position to glTF node TRS. With import_yup=False, output Z-up."""
-    return rf_to_blender(v)
-
-def quat_gltf_vert_to_rf(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    """Convert glTF vertex-space quaternion to RF (Z-up → Y-up)."""
-    return quat_blender_to_rf(q)
-
-def quat_rf_to_gltf_vert(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    """Convert RF quaternion to glTF vertex space (Y-up → Z-up)."""
-    return quat_rf_to_blender(q)
-
-def quat_gltf_trs_to_rf(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    """Convert glTF node quaternion to RF. With export_yup=False, data is Z-up."""
-    return quat_blender_to_rf(q)
-
-def quat_rf_to_gltf_trs(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    """Convert RF quaternion to glTF node TRS. With import_yup=False, output Z-up."""
-    return quat_rf_to_blender(q)
-
-# Aliases (used by older code paths that don't distinguish vert vs trs)
-def gltf_to_rf(v): return blender_to_rf(v)
-def rf_to_gltf(v): return rf_to_blender(v)
-def quat_gltf_to_rf(q): return quat_blender_to_rf(q)
-def quat_rf_to_gltf(q): return quat_rf_to_blender(q)
+    # inverse of rf_to_blender: (bx,by,bz)=(-sx,-sz,sy)
+    sx = -bx
+    sy = bz
+    sz = -by
+    return (sx, sy, sz)
 
 def read_vec3_rf(b: Bin) -> Tuple[float, float, float]:
     return (b.f32(), b.f32(), b.f32())
@@ -171,22 +126,11 @@ def read_quat_raw(b: Bin) -> Tuple[float, float, float, float]:
 # M is orthonormal (with reflection), so inverse is transpose.
 # ----------------------------
 
-# M maps Blender vectors to RF vectors: v_rf = M * v_bl
-# Convention: RF ↔ glTF Y-up RH conversion is just "negate X" (Redux's RfToRh).
-# Blender's glTF importer applies its own Y-up→Z-up rotation on top, which
-# combined with our negate-X gives the V3M-tool-aligned final orientation in
-# Blender. We rely on Blender's importer for the up-axis swap rather than
-# baking it into our data — older code tried to bake it in via _M and use
-# `import_yup=False`, but that flag doesn't exist in Blender 4.x's glTF
-# importer (Blender always applies Y-up→Z-up), which produced the
-# "model lying flat" symptom.
-# det(M) = -1 (reflection — triangle winding flips on round-trip;
-# _flip_gltf_winding_in_place compensates).
-# M = diag(-1, 1, 1)
+# M = [[-1,0,0],[0,0,-1],[0,1,0]]
 _M = (
     (-1.0, 0.0, 0.0),
+    ( 0.0, 0.0,-1.0),
     ( 0.0, 1.0, 0.0),
-    ( 0.0, 0.0, 1.0),
 )
 
 def mat3_mul(a, b):
@@ -243,18 +187,6 @@ def mat3_to_quat(m: Tuple[Tuple[float,float,float],Tuple[float,float,float],Tupl
         z = 0.25*S
     return quat_norm((x,y,z,w))
 
-def quat_rotate_point(q: Tuple[float,float,float,float], p: Tuple[float,float,float]) -> Tuple[float,float,float]:
-    """Rotate point p by quaternion q (xyzw format)."""
-    qx,qy,qz,qw = q
-    px,py,pz = p
-    # q * p * q_conj using expanded formula
-    tx = 2.0 * (qy*pz - qz*py)
-    ty = 2.0 * (qz*px - qx*pz)
-    tz = 2.0 * (qx*py - qy*px)
-    return (px + qw*tx + (qy*tz - qz*ty),
-            py + qw*ty + (qz*tx - qx*tz),
-            pz + qw*tz + (qx*ty - qy*tx))
-
 def quat_norm(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
     x,y,z,w = q
     n = math.sqrt(x*x+y*y+z*z+w*w)
@@ -264,18 +196,17 @@ def quat_norm(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,floa
     return (x*inv,y*inv,z*inv,w*inv)
 
 def quat_rf_to_blender(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    # RF ↔ glTF Y-up RH quaternion conversion: just negate X (Redux's RfToRh).
-    # Self-inverse, like the position conversion. Blender's glTF importer
-    # then rotates the entire scene Y-up→Z-up, which carries the quaternion
-    # along correctly without any further work needed here.
-    qx, qy, qz, qw = q
-    return (-qx, qy, qz, qw)
+    R = quat_to_mat3(q)
+    Rt = mat3_mul(mat3_mul(_M, R), mat3_T(_M))
+    return mat3_to_quat(Rt)
 
 
 def quat_blender_to_rf(q: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
-    # Self-inverse: same operation as quat_rf_to_blender.
-    qx, qy, qz, qw = q
-    return (-qx, qy, qz, qw)
+    # Inverse of quat_rf_to_blender.
+    # If qb = M * qrf * M^T (as rotation matrices), then qrf = M^T * qb * M.
+    Rb = quat_to_mat3(q)
+    Rt = mat3_mul(mat3_mul(mat3_T(_M), Rb), _M)
+    return mat3_to_quat(Rt)
 
 def quat_dot(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -> float:
     return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
@@ -641,7 +572,7 @@ def parse_mesh(b: Bin, hdr: VfxHeader, section_end: int) -> VfxMesh:
             v = read_vec3_rf(b)
             _ = read_vec3_rf(b); _ = read_vec3_rf(b)
             t_times.append((t_raw / 320.0) / float(fps))
-            t_vals.append(rf_to_gltf_trs(v))
+            t_vals.append(rf_to_blender(v))
         num_r = b.s32()
         r_times: List[float] = []
         r_vals: List[Tuple[float,float,float,float]] = []
@@ -650,7 +581,7 @@ def parse_mesh(b: Bin, hdr: VfxHeader, section_end: int) -> VfxMesh:
             q = read_quat_raw(b)
             _ = b.f32(); _ = b.f32(); _ = b.f32(); _ = b.f32(); _ = b.f32()
             r_times.append((t_raw / 320.0) / float(fps))
-            r_vals.append(quat_rf_to_gltf_trs(q))
+            r_vals.append(quat_rf_to_blender(q))
         num_s = b.s32()
         s_times: List[float] = []
         s_vals: List[Tuple[float,float,float]] = []
@@ -1104,7 +1035,7 @@ def decompress_positions_bl(fr: MeshFrame, num_vertices: int) -> List[Tuple[floa
         vx = cx + (mx * float(ix))
         vy = cy + (my * float(iy))
         vz = cz + (mz * float(iz))
-        out.append(rf_to_gltf((vx, vy, vz)))
+        out.append(rf_to_blender((vx, vy, vz)))
     return out
 
 
@@ -1152,7 +1083,7 @@ def encode_positions_to_s16(positions_bl: List[Tuple[float,float,float]]) -> Tup
     if not positions_bl:
         return (0.0,0.0,0.0), (1.0,1.0,1.0), []
     # convert to stored basis
-    ps = [gltf_to_rf(p) for p in positions_bl]
+    ps = [blender_to_rf(p) for p in positions_bl]
     xs = [p[0] for p in ps]; ys = [p[1] for p in ps]; zs = [p[2] for p in ps]
     mins = (min(xs), min(ys), min(zs))
     maxs = (max(xs), max(ys), max(zs))
@@ -1549,7 +1480,7 @@ def patch_vfx_apply_mesh_offsets(template_vfx: str, out_vfx: str, mesh_offsets: 
         ox,oy,oz = mesh_offsets[key]
         if abs(scale) > 1e-12:
             ox /= scale; oy /= scale; oz /= scale
-        off_rf = gltf_to_rf((ox,oy,oz))
+        off_rf = blender_to_rf((ox,oy,oz))
         for fi, fr in enumerate(m.frames):
             if fr.center_ofs is None:
                 continue
@@ -1635,7 +1566,7 @@ def export_gltf(
                 t_rf = fr.translation_rf or (0.0,0.0,0.0)
                 r_raw = fr.rotation_raw or (0.0,0.0,0.0,1.0)
                 s_rf = fr.scale_rf or (1.0,1.0,1.0)
-                trs_frames.append((rf_to_gltf_trs(t_rf), quat_rf_to_gltf_trs(r_raw), (abs(s_rf[0]), abs(s_rf[2]), abs(s_rf[1]))))
+                trs_frames.append((rf_to_blender(t_rf), quat_rf_to_blender(r_raw), (abs(s_rf[0]), abs(s_rf[2]), abs(s_rf[1]))))
 
         # Pivot scale (pre-keyframe) — this is the missing ingredient for correct scale on keyframed meshes (e.g. flagpole)
         # In CTFflag-blue, pivot_scale ~0.13495 and scale keyframe is 1.2, so effective scale is 0.161943 (what we debugged in Chat 04).
@@ -1795,8 +1726,8 @@ def export_gltf(
                 pr_raw = m.pivot_rotation_raw or (0.0,0.0,0.0,1.0)
                 ps_rf = m.pivot_scale_rf or (1.0,1.0,1.0)
 
-                pt_bl = rf_to_gltf_trs(pt_rf)
-                pr_bl = quat_rf_to_gltf_trs(pr_raw)
+                pt_bl = rf_to_blender(pt_rf)
+                pr_bl = quat_rf_to_blender(pr_raw)
 
                 # If we baked pivot_scale (and possibly constant scale keys) into geometry, keep pivot scale at identity.
                 if baked_geom_scale is not None and skip_scale_anim:
@@ -1834,9 +1765,9 @@ def export_gltf(
         node_by_name[d.name] = di
         pending_parent.append((di, d.parent_name))
         # set base TRS
-        gb.set_node_trs(di, t=tuple(x*trs_scale for x in rf_to_gltf_trs(d.pos_rf)), r=quat_rf_to_gltf_trs(d.orient_raw), s=(1.0,1.0,1.0))
+        gb.set_node_trs(di, t=tuple(x*trs_scale for x in rf_to_blender(d.pos_rf)), r=quat_rf_to_blender(d.orient_raw), s=(1.0,1.0,1.0))
         if debug_frames:
-            print(f"        {d.name} parent={d.parent_name} pos_rf={d.pos_rf} frames={len(d.frames)}")
+            print(f"        {d.name} parent={d.parent_name} pos={rf_to_blender(d.pos_rf)} frames={len(d.frames)}")
         dummy_infos.append({"dummy": d, "node_i": di})
 
     # --- Particle System nodes ---
@@ -1977,8 +1908,8 @@ def export_gltf(
         t_seq = []
         r_seq = []
         for fr in d.frames:
-            t = rf_to_gltf_trs(fr.pos_rf)
-            r = quat_rf_to_gltf_trs(fr.orient_raw)
+            t = rf_to_blender(fr.pos_rf)
+            r = quat_rf_to_blender(fr.orient_raw)
             t_seq.append((t[0]*trs_scale, t[1]*trs_scale, t[2]*trs_scale))
             r_seq.append(r)
         r_seq = quat_fix_sign_seq(r_seq)
@@ -2230,15 +2161,13 @@ def _build_part_section(
     save_parent: int,
     positions_rf: List[Tuple[float,float,float]],
     orientations_rf: List[Tuple[float,float,float,float]],
-    flags: int = 0x04,           # 0x04 = facing (verified: SonarAttack.vfx), 0x10 = drops
-    decay: float = 5.0,
+    flags: int = 0x10,           # 0x10 = facing
+    lifetime: int = 30,
     fps: int = 15,
     particle_size: float = 0.5,
     speed: float = 0.4,
-    size_at_birth: float = 0.0,
-    size_at_death: float = -0.2,
-
-    spawn_delay: float = 0.05,
+    shrink_ratio: float = 0.2,
+    birth_rate: int = 10,
     apply_gravity: int = 0,
     fade_at_death: float = 0.6,
     size_variation: float = 0.0,
@@ -2246,11 +2175,6 @@ def _build_part_section(
     gravity_strength: float = 1.0,
     emitter_radius: float = 0.0,
     random_direction: float = 30.0,
-    tail_distance: float = 0.0,
-    fade_at_birth: float = 0.0,
-    decay_variation: float = 1.0,
-    spawn_delay_variation: float = 0.01,
-    has_dummies: bool = False,
 ) -> bytes:
     """Build a complete PART section body from emitter parameters and per-frame TRS.
     
@@ -2262,10 +2186,7 @@ def _build_part_section(
     _rng.seed(hash(name) & 0xFFFFFFFF)  # deterministic per emitter name
 
     num_entries = len(positions_rf)
-    # Spawn count drives particle generation. Use generous calculation.
-    # Convert spawn_delay (seconds) to effective birth_rate
-    _birth_rate = max(1.0 / max(spawn_delay, 0.001), 1.0)
-    total_spawn = max(min(int(_birth_rate * fps * num_entries), 10000), 1000)
+    total_spawn = birth_rate * fps * lifetime // 15  # observed formula from real files
     grav_val = int(apply_gravity)
 
     out = bytearray()
@@ -2273,48 +2194,36 @@ def _build_part_section(
     out += _pack_strz(parent_name)
     out += struct.pack("<b", int(save_parent))
 
-    # Header layout VERIFIED against 38 Volition VFX files (SonarAttack + shipexp + SpitAttack etc.)
-    # unk1 = count of wind/force object strings that follow (e.g. "VWind01").
-    #   Standard authored emitters = 0. Wind refs unsupported in our tool, so always 0.
-    # unk5 = shrink_at_birth — CONFIRMED from corpus:
-    #   shipexp VP05-09 unk5=0.20, shrink_d=0.10 (fireballs grow then shrink)
-    #   shipexp VP10 unk5=0.08, TorpedoHit VP02 unk5=0.345. Matches VParticle README exactly.
-    # unk2 = 0 in all 38 samples (unknown, harmless).
-    # unk3 = varies (-2,-1,0,3,4), purpose unknown, keep 0.
+    # 14-field header (11 ints + 3 floats)
     out += struct.pack("<i", int(flags))
-    out += struct.pack("<i", 0)                    # unk1 = force-object count (0 = no wind)
-    out += struct.pack("<i", 0)                    # unk2 — always 0 across all 38 samples
+    out += struct.pack("<i", 0)                    # unk1
+    out += struct.pack("<i", 0)                    # unk2
     out += struct.pack("<i", int(num_entries))      # num_entries (one per frame)
-    # Lifetime: engine crashes when >= 2 with mesh+particle VFX. Always write 0.
-    out += struct.pack("<i", 0)                    # particle lifetime (0=safe)
-    out += struct.pack("<i", int(fps))              # fps — VERIFIED ✓
-    out += struct.pack("<i", 0)                    # unk3 — keep 0 (purpose unknown)
-    out += struct.pack("<i", int(total_spawn))      # total_spawn — VERIFIED ✓
-    out += struct.pack("<f", float(tail_distance))  # tail distance (Drops only) — VERIFIED ✓
-    out += struct.pack("<i", grav_val)              # apply_gravity 0/1 — VERIFIED ✓
-    # unk5 = shrink_at_birth: fraction of lifetime during which particle grows from size 0.
-    # CONFIRMED from 38-file corpus. Positive size_at_birth value maps directly here.
-    _shrink_birth_val = max(0.0, min(float(size_at_birth), 1.0)) if size_at_birth > 0 else 0.0
-    out += struct.pack("<f", _shrink_birth_val)     # shrink_at_birth — CONFIRMED unk5 ✓
-    out += struct.pack("<f", float(particle_size))     # particle size — VERIFIED ✓
-    # Size at death: negative = shrink (map abs to engine 0-1), positive = grow (0)
-    _shrink_val = min(abs(size_at_death), 1.0) if size_at_death < 0 else 0.0
-    out += struct.pack("<f", _shrink_val)               # shrink at death — VERIFIED ✓
-    out += struct.pack("<f", float(fade_at_death))     # fade at death — VERIFIED ✓
+    out += struct.pack("<i", int(lifetime))         # particle lifetime (frames at fps)
+    out += struct.pack("<i", int(fps))              # fps
+    out += struct.pack("<i", 0)                    # unk3
+    out += struct.pack("<i", int(total_spawn))      # total_spawn
+    out += struct.pack("<i", 0)                    # unk4
+    out += struct.pack("<i", grav_val)              # apply_gravity
+    out += struct.pack("<i", 0)                    # unk5
+    out += struct.pack("<f", float(gravity_strength))  # float_00 (gravity multiplier)
+    out += struct.pack("<f", 0.0)                  # float_01
+    out += struct.pack("<f", float(fade_at_death))  # float_02 (fade_at_death ratio)
 
     # Per-frame entries: 13 floats each
-    # Per-entry decay with variation applied to death_start only
-    _base_lifetime_frames = int(decay * fps)  # convert decay (seconds) to frames
-    death_start = max(0, num_entries - _base_lifetime_frames)
+    death_start = max(0, num_entries - lifetime)
     rad_spread = math.radians(float(random_direction) * 0.5) if random_direction > 0.0 else 0.0
 
     for fi in range(num_entries):
         px, py, pz = positions_rf[fi]
         qx, qy, qz, qw = orientations_rf[fi]
 
-        # Emitter radius is passed to engine via f11/f12 fields.
-        # Don't offset the stored position - that makes the emitter jump around.
-        # The engine spreads individual particles around the emitter position.
+        # Apply emitter radius offset (randomized per frame for spawn spread)
+        if emitter_radius > 0.0:
+            dx = _rng.uniform(-emitter_radius, emitter_radius)
+            dy = _rng.uniform(-emitter_radius, emitter_radius)
+            dz = _rng.uniform(-emitter_radius, emitter_radius)
+            px += dx; py += dy; pz += dz
 
         # Apply random direction spread to orientation
         if rad_spread > 0.0:
@@ -2341,31 +2250,21 @@ def _build_part_section(
         f_speed = float(speed) + _rng.uniform(-speed_variation, speed_variation)
         f_speed = max(0.0, f_speed)
 
-        # Per-entry fields f7-f12: engine emitter state per frame.
-        # GROUND TRUTH from SonarAttack.vfx (Volition original, decoded byte-for-byte):
-        #   flags=0x04 (FACING), particle_size=0.445, shrink_death=0.355, fade_death=0.635
-        #   fps=10, total_spawn=4480, num_entries=26
-        #   f7=0.000  f8=0.000  f9=0.7953  f10=0.2540  f11=0.000  f12=0.002232
-        # Verified formulas:
-        #   f7  = speed * 0.5              (velocity factor; 0 for no-velocity emitters)
-        #   f8  = speed * 0.5              (velocity derivative, same as f7)
-        #   f9  = (1/spawn_delay)/fps*0.5  (spawn rate normalized; Sonar: ~15.9 p/s / 10fps * 0.5 = 0.795)
-        #   f10 = particle_size * ~0.57    (size factor; exact formula unknown, 0.5 is approximate)
-        #   f11 = emitter_radius * 0.1     (emitter spread; 0 for point emitters)
-        #   f12 = fps / total_spawn        (spawn density inverse; VERIFIED: 10/4480 = 0.002232 ✓)
-        # Per-entry spawn delay with variation
-        _sd_var = _rng.uniform(-spawn_delay_variation, spawn_delay_variation) if spawn_delay_variation > 0 else 0.0
-        _sd = max(spawn_delay + _sd_var, 0.001)
-        _brate = 1.0 / _sd                         # particles per second
-        f7  = f_speed * 0.5                         # velocity factor (Sonar ground truth: 0.0 at speed=0 ✓)
-        f8  = f_speed * 0.5                         # velocity derivative (same as f7)
-        f9  = min(_brate / max(float(fps), 1.0) * 0.5, 1.0)  # spawn rate per frame (Sonar: 0.7953 ✓)
-        f10 = f_size * 0.5                          # size factor (Sonar actual: 0.254 vs size=0.445 → ratio 0.571; approx only)
-        f11 = float(emitter_radius) * 0.1           # emitter spread (Sonar: 0.0 at radius=0 ✓)
-        # f12: verified against SonarAttack.vfx ground truth.
-        # actual f12 = fps / total_spawn = 10 / 4480 = 0.002232 (matches file exactly).
-        # Previous formula max(1/total_spawn, 0.001) gave 0.001 — wrong by 2.2x.
-        f12 = float(fps) / max(total_spawn, 1)           # spawn density inverse
+        # f7: particle size, f8: speed, f9: shrink ratio
+        f7 = f_size
+        f8 = f_speed
+        f9 = float(shrink_ratio)
+
+        # f10: active birth rate multiplier (ramps down near end)
+        if fi >= death_start:
+            progress = (fi - death_start) / max(1, lifetime)
+            f10 = f_size * (1.0 - progress * 0.6)
+        else:
+            f10 = f_size
+
+        # f11: tail/min size, f12: negligible
+        f11 = f_size * 0.1
+        f12 = 0.0
 
         out += struct.pack("<13f", px, py, pz, qx, qy, qz, qw, f7, f8, f9, f10, f11, f12)
 
@@ -2484,8 +2383,7 @@ def export_new_vfx_from_gltf(gltf_path: str,
                              anchor: Optional[str] = None,
                              template_vfx: Optional[str] = None,
                              debug: bool = False,
-                             baked_frames_path: Optional[str] = None,
-                             morph_fps: int = 15) -> None:
+                             baked_frames_path: Optional[str] = None) -> None:
     g = _gltf_load_json(gltf_path)
     bin_data = _gltf_load_bin(g, gltf_path)
     nodes = g.get("nodes") or []
@@ -2771,18 +2669,14 @@ def export_new_vfx_from_gltf(gltf_path: str,
                     t_b = (t_b[0] - anchor_shift[0], t_b[1] - anchor_shift[1], t_b[2] - anchor_shift[2])
                 # Read flat IDprops from extras
                 ps_author = {
-                    "flags": int(node_extras.get("rfvfx_pe_flags", 0x04)),  # 0x04=FACING (verified), 0x10=DROPS
+                    "flags": int(node_extras.get("rfvfx_pe_flags", 0x10)),
                     "particle_size": float(node_extras.get("rfvfx_pe_size", 0.45)),
-                    "spawn_delay": float(node_extras.get("rfvfx_pe_spawn_delay", 0.05)),
-                    "spawn_delay_variation": float(node_extras.get("rfvfx_pe_spawn_delay_var", 0.01)),
+                    "birth_rate": int(node_extras.get("rfvfx_pe_birth_rate", 10)),
                     "speed": float(node_extras.get("rfvfx_pe_speed", 0.42)),
-                    "decay": float(node_extras.get("rfvfx_pe_decay", 5.0)),
-                    "decay_variation": float(node_extras.get("rfvfx_pe_decay_var", 1.0)),
+                    "lifetime": int(node_extras.get("rfvfx_pe_lifetime", 30)),
                     "fps": int(node_extras.get("rfvfx_pe_fps", 15)),
                     "apply_gravity": int(node_extras.get("rfvfx_pe_gravity", 0)),
-                    "size_at_birth": float(node_extras.get("rfvfx_pe_size_birth", 0.0)),
-                    "size_at_death": float(node_extras.get("rfvfx_pe_size_death", -0.2)),
-                    
+                    "shrink_ratio": float(node_extras.get("rfvfx_pe_shrink", 0.2)),
                     "fade_at_death": float(node_extras.get("rfvfx_pe_fade", 0.6)),
                     "save_parent": int(node_extras.get("rfvfx_pe_save_parent", 0)),
                     "texture_name": str(node_extras.get("rfvfx_pe_texture", "")),
@@ -2792,8 +2686,6 @@ def export_new_vfx_from_gltf(gltf_path: str,
                     "gravity_strength": float(node_extras.get("rfvfx_pe_grav_str", 1.0)),
                     "emitter_radius": float(node_extras.get("rfvfx_pe_emit_rad", 0.0)),
                     "random_direction": float(node_extras.get("rfvfx_pe_rand_dir", 30.0)),
-                    "tail_distance": float(node_extras.get("rfvfx_pe_tail_dist", 0.0)),
-                    "fade_at_birth": float(node_extras.get("rfvfx_pe_fade_birth", 0.0)),
                 }
                 raw_b64 = node_extras.get("rfvfx_pe_raw_b64", "")
                 if raw_b64:
@@ -2806,11 +2698,8 @@ def export_new_vfx_from_gltf(gltf_path: str,
                     "r": r_b,
                     "ps_data": ps_author,
                 })
-            # Treat non-particle empties as DMMY (attachment points, markers, props)
-            elif not is_authored_emitter and not (isinstance(ps_data, dict) and ps_data.get("rf_vfx_particle")):
-                # Skip RFVFX_ROOT — it's the scene root, not a game dummy
-                if name == "RFVFX_ROOT" or name == "Scene Root":
-                    continue
+            # Treat '$*' nodes as DMMY (markers/props)
+            elif name.startswith("$"):
                 # DMMY nodes must use THEIR OWN local TRS. Do NOT reuse the last mesh's t_b/r_b.
                 t_b = (float(t[0]), float(t[1]), float(t[2]))
                 r_b = (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
@@ -2835,7 +2724,7 @@ def export_new_vfx_from_gltf(gltf_path: str,
     for old in used_mat_ids:
         tex0 = gltf_tex0_by_mat.get(int(old), "")
         mat_additive = 0
-        mat_self_illum = 0.0  # default: normal lighting (scene-lit)
+        mat_self_illum = 1.0  # VFX default: fully self-lit (effects glow)
         mat_opacity: Optional[List[float]] = None
         mat_self_illum_list: Optional[List[float]] = None
         # Template material data takes priority (preserves original values)
@@ -2881,19 +2770,6 @@ def export_new_vfx_from_gltf(gltf_path: str,
     for mo in mesh_objs:
         mo["material_index"] = int(mat_id_remap.get(int(mo.get("material_index", 0)), 0))
 
-    # Particle materials come FIRST in MATL section order.
-    # Offset mesh material indices by the number of unique particle textures.
-    _ptex_set: set = set()
-    for po in particle_objs:
-        ps = po.get("ps_data") or po.get("ps_author") or {}
-        tex = str(ps.get("texture_name", "") or "").strip()
-        if tex:
-            _ptex_set.add(tex)
-    _num_ptex = len(_ptex_set)
-    if _num_ptex > 0:
-        for mo in mesh_objs:
-            mo["material_index"] = int(mo.get("material_index", 0)) + _num_ptex
-
 
     # --- infer durations (global end_frame is in 15fps units) ---
     max_end_time = 0.0
@@ -2905,11 +2781,9 @@ def export_new_vfx_from_gltf(gltf_path: str,
         if wa:
             times, weights_flat, num_targets = wa
             inferred_fps = _infer_fps_from_times(times, default_fps=15)
-            # Use the user-specified morph_fps for storage rate.
-            # The RF engine interpolates between stored frames at playback,
-            # so lower rates (5/10fps) save significant file size for smooth
-            # organic animations. Verified from Volition originals (CTFbanner=5fps).
-            fps = int(morph_fps)
+            # Force 15fps for RF compatibility. Remap times to 15fps spacing.
+            fps = 15
+            # Recalculate end time based on number of animation samples at 15fps
             num_weight_samples = len(times) if times else 0
             if num_weight_samples > 0:
                 end_t = float(num_weight_samples - 1) / float(fps)
@@ -2919,7 +2793,7 @@ def export_new_vfx_from_gltf(gltf_path: str,
             if end_t > max_end_time: max_end_time = end_t
         else:
             # no anim; still has targets
-            fps = int(morph_fps)
+            fps = 15
             end_t = float(len(mo["targets"])) / float(fps) if mo["targets"] else 0.0
             morph_meta[mo["name"].lower()] = {"times": None, "weights": None, "num_targets": len(mo["targets"]), "fps": fps}
             if end_t > max_end_time: max_end_time = end_t
@@ -2927,22 +2801,13 @@ def export_new_vfx_from_gltf(gltf_path: str,
     end_frame = int(round(max_end_time * 15.0))
     if end_frame < 0: end_frame = 0
 
-    # If the baked sidecar includes an explicit end_frame (written by the add-on
-    # when step > 1 is used), use it as the authoritative source. This avoids the
-    # glTF animation time inference being wrong when the frame range was shortened
-    # by the Speed Step bake setting.
-    sidecar_end_frame = baked_frames_data.get("_end_frame_15fps") if baked_frames_data else None
-    if isinstance(sidecar_end_frame, (int, float)) and int(sidecar_end_frame) > 0:
-        end_frame = int(sidecar_end_frame)
+    # Check glTF scene extras for original end_frame (round-trip from VFX import)
+    scene_extras = (g.get("scenes") or [{}])[0].get("extras", {})
+    scene_rf = scene_extras.get("rf_vfx", {}) if isinstance(scene_extras, dict) else {}
+    gltf_end_frame = scene_rf.get("end_frame") if isinstance(scene_rf, dict) else None
+    if isinstance(gltf_end_frame, (int, float)) and int(gltf_end_frame) > end_frame:
+        end_frame = int(gltf_end_frame)
         max_end_time = float(end_frame) / 15.0
-    else:
-        # Fallback: check glTF scene extras for original end_frame (round-trip from VFX import)
-        scene_extras = (g.get("scenes") or [{}])[0].get("extras", {})
-        scene_rf = scene_extras.get("rf_vfx", {}) if isinstance(scene_extras, dict) else {}
-        gltf_end_frame = scene_rf.get("end_frame") if isinstance(scene_rf, dict) else None
-        if isinstance(gltf_end_frame, (int, float)) and int(gltf_end_frame) > end_frame:
-            end_frame = int(gltf_end_frame)
-            max_end_time = float(end_frame) / 15.0
     # RF ignores VFX files with end_frame=0. Static meshes need at least 1 frame.
     if end_frame == 0 and (mesh_objs or dummy_objs or particle_objs):
         end_frame = 1
@@ -3004,32 +2869,10 @@ def export_new_vfx_from_gltf(gltf_path: str,
             targets_bl = (mo.get("targets") or [])
         uv_bl = None
         if mo["uv"] is not None:
-            # glTF always flips V (1-v) from Blender convention.
-            # RF uses V=0 at bottom (same as Blender/3ds Max).
-            # Undo the glTF flip: v_rf = 1 - v_gltf = v_blender
-            uv_bl = [(u[0], 1.0 - u[1]) for u in mo["uv"]]
+            uv_bl = [(u[0], u[1]) for u in mo["uv"]]
         indices = mo["indices"]
         num_vertices = len(pos_bl)
         num_faces = int(len(indices) // 3)
-
-        # Double-sided: duplicate faces with reversed winding
-        node_ex_ds = mo.get("extras") or {}
-        rf_ex_ds = mo.get("rf_vfx") or {}
-        _ds = node_ex_ds.get("rfvfx_double_sided")
-        if _ds is None:
-            _ds = rf_ex_ds.get("double_sided") if isinstance(rf_ex_ds, dict) else None
-        flag_double_sided = bool(int(_ds)) if _ds is not None else False
-        if flag_double_sided:
-            extra_indices = []
-            for fi in range(num_faces):
-                i0 = indices[fi*3+0]
-                i1 = indices[fi*3+1]
-                i2 = indices[fi*3+2]
-                # Reverse winding: swap i0 and i2
-                extra_indices.extend([i2, i1, i0])
-            indices = list(indices) + extra_indices
-            num_faces = int(len(indices) // 3)
-
         total_faces += num_faces
 
         # materials per mesh (simple: one)
@@ -3071,14 +2914,12 @@ def export_new_vfx_from_gltf(gltf_path: str,
         flag_facing_rod = _flag_bool("rfvfx_facing_rod", "facing_rod", False)
         flag_morph = is_morph  # morph flag MUST match data layout (shape keys present or not)
         flag_dump_uvs = _flag_bool("rfvfx_dump_uvs", "dump_uvs", False)
-        flag_fullbright = _flag_bool("rfvfx_fullbright", "fullbright", False)
-        mo["_fullbright"] = flag_fullbright
 
         # Build flags_raw from resolved booleans
         # If rf_vfx has the original flags_raw AND no authoring overrides, prefer it
         # (preserves unknown flag bits we don't decode)
         has_authoring_flags = any(node_ex.get(k) is not None for k in
-            ("rfvfx_facing", "rfvfx_facing_rod", "rfvfx_morph", "rfvfx_dump_uvs", "rfvfx_fullbright"))
+            ("rfvfx_facing", "rfvfx_facing_rod", "rfvfx_morph", "rfvfx_dump_uvs"))
         if not has_authoring_flags and isinstance(rf_ex.get("flags_raw"), (int, float)):
             # Preserve original flags_raw (including any unknown bits)
             flags_raw = int(rf_ex["flags_raw"])
@@ -3091,7 +2932,6 @@ def export_new_vfx_from_gltf(gltf_path: str,
             flags_raw = 0
             if flag_facing:     flags_raw |= 0x00000001
             if flag_morph:      flags_raw |= 0x00000004
-            if flag_fullbright: flags_raw |= 0x00000010
             if flag_dump_uvs:   flags_raw |= 0x00000100
             if flag_facing_rod: flags_raw |= 0x00000800
 
@@ -3111,9 +2951,8 @@ def export_new_vfx_from_gltf(gltf_path: str,
         elif isinstance(rf_ex.get("facing_pairs"), list) and len(rf_ex["facing_pairs"]) > 0:
             facing_width = float(rf_ex["facing_pairs"][0][0])  # use first frame's width
 
-        # fps and num_frames — use morph_fps for morph meshes so file size
-        # matches the user's chosen quality setting (5/10/15fps).
-        fps = int(morph_fps) if is_morph else 15
+        # fps and num_frames
+        fps = 15
         start_time = 0.0
         end_time = float(end_frame) / 15.0 if end_frame > 0 else 0.0
         num_frames = end_frame + 1
@@ -3151,12 +2990,8 @@ def export_new_vfx_from_gltf(gltf_path: str,
         for fi in range(num_faces):
             i0 = int(indices[fi*3+0]); i1 = int(indices[fi*3+1]); i2 = int(indices[fi*3+2])
             faces_blob += struct.pack("<iii", i0, i1, i2)
-            # Per-face vertex colors (3 verts * RGB = 9 floats).
-            # 0.5 = neutral (scene lighting applies normally).
-            # 1.0 = fullbright (ignores scene lighting).
-            _vc = 1.0 if flag_fullbright else 0.5
             for _ in range(9):
-                faces_blob += struct.pack("<f", _vc)
+                faces_blob += struct.pack("<f", 1.0)
             a = pos_bl[i0]; b = pos_bl[i1]; c = pos_bl[i2]
             n_bl = _tri_normal(a,b,c)
             face_normals.append(n_bl)
@@ -3167,8 +3002,8 @@ def export_new_vfx_from_gltf(gltf_path: str,
                 d=math.sqrt(dx*dx+dy*dy+dz*dz)
                 if d>r: r=d
 
-            faces_blob += _pack_vec3_rf(gltf_to_rf(n_bl))
-            faces_blob += _pack_vec3_rf(gltf_to_rf(center_bl))
+            faces_blob += _pack_vec3_rf(blender_to_rf(n_bl))
+            faces_blob += _pack_vec3_rf(blender_to_rf(center_bl))
             faces_blob += struct.pack("<f", float(r))
             faces_blob += struct.pack("<i", 0)    # material_index (mesh-local)
             faces_blob += struct.pack("<i", smoothing_group)
@@ -3236,7 +3071,7 @@ def export_new_vfx_from_gltf(gltf_path: str,
 
         # Bounding sphere
         bcenter_bl, brad = _bounds_center_radius(pos_bl)
-        bcenter_rf = gltf_to_rf(bcenter_bl)
+        bcenter_rf = blender_to_rf(bcenter_bl)
 
         # Mesh body
         body = bytearray()
@@ -3319,33 +3154,6 @@ def export_new_vfx_from_gltf(gltf_path: str,
                     frame_positions.append(frame_pts)
                 # Adjust num_frames/end_frame to match baked data
                 num_frames = len(frame_positions)
-                # Baked sidecar uses Blender native vertex count which may differ
-                # from glTF vertex count (glTF splits at UV/normal seams).
-                # Map baked vertices to glTF indices using frame 0 position matching.
-                baked_nv = len(frame_positions[0]) if frame_positions else num_vertices
-                if baked_nv != num_vertices and frame_positions:
-                    # Build mapping: for each glTF vert, find nearest baked vert
-                    gltf_f0 = [(p[0]/gltf_scale, p[1]/gltf_scale, p[2]/gltf_scale) for p in mo["positions"]]
-                    baked_f0 = frame_positions[0]
-                    gltf_to_baked = []
-                    for gi in range(num_vertices):
-                        gp = gltf_f0[gi]
-                        best_bi = 0
-                        best_d = 1e30
-                        for bi in range(baked_nv):
-                            bp = baked_f0[bi]
-                            d = (gp[0]-bp[0])**2 + (gp[1]-bp[1])**2 + (gp[2]-bp[2])**2
-                            if d < best_d:
-                                best_d = d
-                                best_bi = bi
-                                if d < 1e-12:
-                                    break
-                        gltf_to_baked.append(best_bi)
-                    # Remap all frames to glTF vertex count
-                    remapped = []
-                    for fp in frame_positions:
-                        remapped.append([fp[gltf_to_baked[gi]] for gi in range(num_vertices)])
-                    frame_positions = remapped
                 # Pad or trim
                 while len(frame_positions) < num_frames:
                     frame_positions.append(list(frame_positions[-1]))
@@ -3383,7 +3191,7 @@ def export_new_vfx_from_gltf(gltf_path: str,
 
             for fi in range(num_frames):
                 pts_bl = frame_positions[fi]
-                pts_rf = [gltf_to_rf(p) for p in pts_bl]
+                pts_rf = [blender_to_rf(p) for p in pts_bl]
                 center_rf, mult_rf, s16s = _quantize_positions_rf(pts_rf)
                 body += _pack_vec3_rf(center_rf)
                 body += _pack_vec3_rf(mult_rf)
@@ -3407,7 +3215,7 @@ def export_new_vfx_from_gltf(gltf_path: str,
                             body += _pack_uv(uv)
         else:
             # non-morph: positions only on frame0 (frames >0 usually contain only transforms if not keyframed)
-            pts_rf0 = [gltf_to_rf(p) for p in pos_bl]
+            pts_rf0 = [blender_to_rf(p) for p in pos_bl]
             center_rf0, mult_rf0, s16s0 = _quantize_positions_rf(pts_rf0)
 
             t_bl = mo["t"]
@@ -3438,8 +3246,8 @@ def export_new_vfx_from_gltf(gltf_path: str,
 
                 if not is_keyframed:
                     # Non-keyframed meshes store TRS on every frame
-                    body += _pack_vec3_rf(gltf_trs_to_rf(t_bl))
-                    body += _pack_quat_raw(quat_gltf_trs_to_rf(r_bl))
+                    body += _pack_vec3_rf(blender_to_rf(t_bl))
+                    body += _pack_quat_raw(quat_blender_to_rf(r_bl))
                     body += _pack_vec3_rf((float(s_bl[0]), float(s_bl[2]), float(s_bl[1])))
 
             if is_keyframed:
@@ -3493,8 +3301,8 @@ def export_new_vfx_from_gltf(gltf_path: str,
         body += _pack_strz(do["name"])
         body += _pack_strz(do["parent_name"])
         body += struct.pack("<B", 0)  # save_parent (match RF samples)
-        pos_rf = gltf_trs_to_rf(do["t"])
-        q_rf = quat_gltf_trs_to_rf(do["r"])
+        pos_rf = blender_to_rf(do["t"])
+        q_rf = quat_blender_to_rf(do["r"])
         body += _pack_vec3_rf(pos_rf)
         body += _pack_quat_raw(q_rf)
         body += struct.pack("<i", int(end_frame + 1))
@@ -3519,27 +3327,19 @@ def export_new_vfx_from_gltf(gltf_path: str,
             # Authored: build PART from emitter parameters + position
             t_bl = po.get("t", (0.0, 0.0, 0.0))
             r_bl = po.get("r", (0.0, 0.0, 0.0, 1.0))
-            pos_rf = gltf_trs_to_rf(t_bl)
-            quat_rf = quat_gltf_trs_to_rf(r_bl)
-            # RF engine emits particles along local +Y.
-            # Apply 180° X flip to reverse direction.
-            fx, fy, fz, fw = quat_rf
-            quat_rf = (fw, -fz, fy, -fx)
+            pos_rf = blender_to_rf(t_bl)
+            quat_rf = quat_blender_to_rf(r_bl)
             # Static emitter: same position/orientation every frame
             num_entries = end_frame + 1
             positions_rf = [pos_rf] * num_entries
             orientations_rf = [quat_rf] * num_entries
-            # Determine particle parent: working game files always have a valid parent.
-            # If meshes exist, parent to the anchor/first mesh (like C08: parent='Mesh03').
-            # If no meshes, use 'Scene Root' (like SonarAttack).
+            # Sanitize parent name: 'Scene Root' is a glTF/Blender concept,
+            # not a valid RF object. Use empty string (no parent) unless
+            # the parent is an actual mesh or dummy in the VFX.
             part_parent = po["parent_name"]
             valid_parents = set(mo["name"] for mo in mesh_objs) | set(do["name"] for do in dummy_objs)
             if part_parent not in valid_parents:
-                if mesh_objs:
-                    # Parent to anchor mesh or first mesh
-                    part_parent = mesh_objs[0]["name"]
-                else:
-                    part_parent = "Scene Root"
+                part_parent = ""
             part_body = _build_part_section(
                 name=po["name"],
                 parent_name=part_parent,
@@ -3547,14 +3347,12 @@ def export_new_vfx_from_gltf(gltf_path: str,
                 positions_rf=positions_rf,
                 orientations_rf=orientations_rf,
                 flags=int(ps.get("flags", 0x10)),
-                decay=float(ps.get("decay", 5.0)),
+                lifetime=int(ps.get("lifetime", 30)),
                 fps=int(ps.get("fps", 15)),
                 particle_size=float(ps.get("particle_size", 0.5)),
                 speed=float(ps.get("speed", 0.4)),
-                size_at_birth=float(ps.get("size_at_birth", 0.0)),
-                size_at_death=float(ps.get("size_at_death", -0.2)),
-                
-                spawn_delay=float(ps.get("spawn_delay", 0.05)),
+                shrink_ratio=float(ps.get("shrink_ratio", 0.2)),
+                birth_rate=int(ps.get("birth_rate", 10)),
                 apply_gravity=int(ps.get("apply_gravity", 0)),
                 fade_at_death=float(ps.get("fade_at_death", 0.6)),
                 size_variation=float(ps.get("size_variation", 0.0)),
@@ -3562,11 +3360,6 @@ def export_new_vfx_from_gltf(gltf_path: str,
                 gravity_strength=float(ps.get("gravity_strength", 1.0)),
                 emitter_radius=float(ps.get("emitter_radius", 0.0)),
                 random_direction=float(ps.get("random_direction", 30.0)),
-                tail_distance=float(ps.get("tail_distance", 0.0)),
-                fade_at_birth=float(ps.get("fade_at_birth", 0.0)),
-                decay_variation=float(ps.get("decay_variation", 1.0)),
-                spawn_delay_variation=float(ps.get("spawn_delay_variation", 0.01)),
-                has_dummies=len(dummy_objs) > 0,
             )
             sec_bytes += _section(SEC_PART, part_body)
             total_part_sys_frames += num_entries
@@ -3587,24 +3380,13 @@ def export_new_vfx_from_gltf(gltf_path: str,
                     })
 
     # Material sections (at end, like sample)
-    # Particle materials FIRST, then mesh materials.
-    # Engine assigns MATL[0..N-1] to particles, MATL[N..] to meshes.
-    num_particle_mats = len(particle_textures)
-    # Post-pass: if a mesh has fullbright enabled, set its material self_illum to 1.0
-    for mo in mesh_objs:
-        if mo.get("_fullbright"):
-            mat_idx = int(mo.get("material_index", 0)) - num_particle_mats
-            if 0 <= mat_idx < len(mats):
-                if not mats[mat_idx].get("self_illum_list"):
-                    mats[mat_idx]["self_illum"] = 1.0
-                    mats[mat_idx]["self_illum_list"] = [1.0]
-    all_mats = particle_textures + list(mats)
-
+    # Mesh materials first, then particle materials
+    all_mats = list(mats) + particle_textures
     for mat_info in all_mats:
         sec_bytes += _section(SEC_MATL, _make_matl_section(
             mat_info["tex0"],
             additive=int(mat_info.get("additive", 0)),
-            self_illum=float(mat_info.get("self_illum", 0.0)),
+            self_illum=float(mat_info.get("self_illum", 1.0)),
             self_illum_list=mat_info.get("self_illum_list"),
             opacity_frames=mat_info.get("opacity"),
         ))
@@ -3686,10 +3468,10 @@ def main(argv: List[str]) -> int:
 
     new_from_gltf: Optional[str] = None
 
+
     anchor_name: Optional[str] = None
     template_vfx: Optional[str] = None
     baked_frames_path: Optional[str] = None
-    morph_fps_cli: int = 15
     i = 0
     files: List[str] = []
     while i < len(args):
@@ -3734,8 +3516,6 @@ def main(argv: List[str]) -> int:
             template_vfx = args[i+1]; i += 2; continue
         if a == "--baked-frames":
             baked_frames_path = args[i+1]; i += 2; continue
-        if a == "--morph-fps":
-            morph_fps_cli = int(args[i+1]); i += 2; continue
 
         if a == "--only-mesh":
             only_meshes = [s.strip() for s in args[i+1].split(",") if s.strip()]; i += 2; continue
@@ -3762,7 +3542,7 @@ def main(argv: List[str]) -> int:
             base = os.path.splitext(os.path.basename(new_from_gltf))[0]
             out_dir = os.path.dirname(os.path.abspath(new_from_gltf)) or "."
             vfx_out = os.path.join(out_dir, base + ".vfx")
-        export_new_vfx_from_gltf(new_from_gltf, vfx_out, gltf_scale=gltf_scale, anchor=anchor_name, template_vfx=template_vfx, debug=debug_frames, baked_frames_path=baked_frames_path, morph_fps=morph_fps_cli)
+        export_new_vfx_from_gltf(new_from_gltf, vfx_out, gltf_scale=gltf_scale, anchor=anchor_name, template_vfx=template_vfx, debug=debug_frames, baked_frames_path=baked_frames_path)
         return 0
 
     if not files:
